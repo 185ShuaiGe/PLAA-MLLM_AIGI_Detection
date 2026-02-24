@@ -20,7 +20,7 @@ class LLMInference(nn.Module):
         self.device = device_config.get_device()
         self._init_tokenizer()
     
-    def _init_tokenizer(self) -&gt; None:
+    def _init_tokenizer(self) -> None:
         """
         初始化 Tokenizer
         """
@@ -36,7 +36,7 @@ class LLMInference(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         vision_tokens: Optional[torch.Tensor] = None
-    ) -&gt; Dict[str, torch.Tensor]:
+    ):
         """
         LLM 前向传播
 
@@ -51,14 +51,43 @@ class LLMInference(nn.Module):
                     注意：序列长度为 N（视觉令牌数量）+ T（文本令牌数量）
                 - 'loss': 可选的损失值（训练时）
         """
-        pass
+        if self.llm_model is None:
+            return {}
+        
+        inputs_embeds = None
+        fused_attention_mask = attention_mask
+        
+        if vision_tokens is not None:
+            if hasattr(self.llm_model, 'get_input_embeddings'):
+                text_embeds = self.llm_model.get_input_embeddings()(input_ids)
+                inputs_embeds = torch.cat([vision_tokens, text_embeds], dim=1)
+                
+                vision_mask = torch.ones(
+                    (vision_tokens.size(0), vision_tokens.size(1)), 
+                    dtype=attention_mask.dtype, 
+                    device=attention_mask.device
+                )
+                fused_attention_mask = torch.cat([vision_mask, attention_mask], dim=1)
+        
+        if inputs_embeds is not None:
+            outputs = self.llm_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=fused_attention_mask
+            )
+        else:
+            outputs = self.llm_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+        
+        return {'logits': outputs.logits}
     
     def generate(
         self,
         prompt: str,
         vision_tokens: Optional[torch.Tensor] = None,
         max_new_tokens: int = 256
-    ) -&gt; str:
+    ) -> str:
         """
         生成自然语言检测结果和解释
 
@@ -118,7 +147,7 @@ class LLMInference(nn.Module):
         image_features: torch.Tensor,
         detection_score: float,
         prompt: Optional[str] = None
-    ) -&gt; str:
+    ) -> str:
         """
         基于视觉令牌生成自然语言解释
 
@@ -134,7 +163,7 @@ class LLMInference(nn.Module):
             return self._fallback_explanation(detection_score)
         
         if prompt is None:
-            if detection_score &gt; 0.5:
+            if detection_score > 0.5:
                 prompt = "Analyze this image and explain why it might be AI-generated."
             else:
                 prompt = "Analyze this image and explain why it seems to be real."
@@ -142,7 +171,7 @@ class LLMInference(nn.Module):
         explanation = self.generate(prompt, image_features)
         return explanation
     
-    def _fallback_explanation(self, detection_score: float) -&gt; str:
+    def _fallback_explanation(self, detection_score: float) -> str:
         """
         当 LLM 不可用时的回退解释
         
@@ -152,20 +181,20 @@ class LLMInference(nn.Module):
         Returns:
             str: 回退解释
         """
-        if detection_score &gt; 0.5:
+        if detection_score > 0.5:
             base_explanation = "This image appears to be AI-generated. "
-            if detection_score &gt; 0.8:
+            if detection_score > 0.8:
                 base_explanation += "The detection confidence is very high. "
             base_explanation += "Potential artifacts include inconsistent textures, unnatural edges, or unusual patterns."
         else:
             base_explanation = "This image appears to be real. "
-            if detection_score &lt; 0.2:
+            if detection_score < 0.2:
                 base_explanation += "The detection confidence is very high. "
             base_explanation += "No obvious AI-generated artifacts were detected."
         
         return base_explanation
     
-    def _postprocess_explanation(self, text: str) -&gt; str:
+    def _postprocess_explanation(self, text: str) -> str:
         """
         后处理生成的解释文本，提高可读性
 
@@ -184,7 +213,7 @@ class LLMInference(nn.Module):
         
         return text
     
-    def _init_lora(self) -&gt; None:
+    def _init_lora(self) -> None:
         """
         初始化 LoRA 配置
 
@@ -200,7 +229,7 @@ class LLMInference(nn.Module):
                 task_type="CAUSAL_LM"
             )
     
-    def _apply_lora(self) -&gt; None:
+    def _apply_lora(self) -> None:
         """
         应用 LoRA 到 LLM 模型
 

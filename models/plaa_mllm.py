@@ -80,16 +80,12 @@ class PLAAMLLM(nn.Module):
                     max_length=self.model_config.max_seq_len
                 ).to(image.device)
                 
-                inputs_embeds, fused_attention_mask = self._early_fusion(
-                    projected_vision_tokens,
-                    tokenized
+                llm_out = self.llm_infer.forward(
+                    input_ids=tokenized['input_ids'],
+                    attention_mask=tokenized['attention_mask'],
+                    vision_tokens=projected_vision_tokens
                 )
-                
-                llm_out = self.llm_infer.llm_model(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=fused_attention_mask
-                )
-                llm_outputs['logits'] = llm_out.logits
+                llm_outputs.update(llm_out)
         except Exception as e:
             pass
         
@@ -105,13 +101,18 @@ class PLAAMLLM(nn.Module):
         with torch.no_grad():
             outputs = self.forward(image, "Classify this image as real or AI-generated.", text_guidance)
             
+            projected_vision_tokens = outputs.get('vision_tokens')
             detection_logits = outputs.get('detection_logits')
             confidence = torch.sigmoid(detection_logits).item() if detection_logits is not None else 0.5
             
             try:
-                explanation = self.llm_infer.generate_explanation(image, "Explain your classification decision.")
+                explanation = self.llm_infer.generate_explanation(
+                    image_features=projected_vision_tokens, 
+                    detection_score=confidence, 
+                    prompt=text_guidance
+                )
             except:
-                explanation = "AI-generated" if confidence > 0.5 else "Real"
+                explanation = "AI-generated" if confidence &gt; 0.5 else "Real"
         
         return confidence, explanation
 

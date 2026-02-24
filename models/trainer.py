@@ -186,7 +186,7 @@ class PLAAMLLMTrainer:
         dice = (2. * intersection + smooth) / (union + smooth)
         return 1 - dice
     
-    def compute_loss_stage2(self, outputs, labels, tokenizer=None):
+    def compute_loss_stage2(self, outputs, labels, tokenizer=None, single_prompt=None):
         logits = outputs.get('logits', None)
         
         if logits is not None:
@@ -195,25 +195,46 @@ class PLAAMLLMTrainer:
             
             expert_text = labels.get('expert_explanation', '')
             if tokenizer is not None and expert_text:
-                tokenized = tokenizer(
-                    expert_text,
+                if single_prompt is not None:
+                    full_text = single_prompt + " " + expert_text
+                else:
+                    full_text = expert_text
+                
+                tokenized_full = tokenizer(
+                    full_text,
                     max_length=self.model_config.max_seq_len,
                     padding='max_length',
                     truncation=True,
                     return_tensors='pt'
                 )
-                target_ids = tokenized['input_ids'].to(self.device)
+                full_target_ids = tokenized_full['input_ids'].to(self.device)
                 
-                ignore_tokens = torch.full(
-                    (target_ids.size(0), num_vision_tokens),
+                num_prompt_tokens = 0
+                if single_prompt is not None:
+                    tokenized_prompt = tokenizer(
+                        single_prompt,
+                        return_tensors='pt'
+                    )
+                    num_prompt_tokens = tokenized_prompt['input_ids'].size(1)
+                
+                ignore_vision = torch.full(
+                    (full_target_ids.size(0), num_vision_tokens),
                     -100,
-                    dtype=target_ids.dtype,
+                    dtype=full_target_ids.dtype,
                     device=self.device
                 )
-                full_target_ids = torch.cat([ignore_tokens, target_ids], dim=1)
+                
+                ignore_prompt = torch.full(
+                    (full_target_ids.size(0), num_prompt_tokens),
+                    -100,
+                    dtype=full_target_ids.dtype,
+                    device=self.device
+                )
+                
+                target_mask = torch.cat([ignore_vision, ignore_prompt, full_target_ids], dim=1)
                 
                 shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = full_target_ids[..., 1:].contiguous()
+                shift_labels = target_mask[..., 1:].contiguous()
                 
                 clm_loss = F.cross_entropy(
                     shift_logits.view(-1, shift_logits.size(-1)),
@@ -251,8 +272,11 @@ class PLAAMLLMTrainer:
     def _compute_log_prob(self, model, image, text):
         outputs = model(image, text)
         logits = outputs.get('logits')
+        vision_tokens = outputs.get('vision_tokens')
         
         if logits is not None and self.tokenizer is not None:
+            num_vision_tokens = vision_tokens.size(1) if vision_tokens is not None else self.model_config.num_latent_queries
+            
             tokenized = self.tokenizer(
                 text,
                 return_tensors='pt',
@@ -262,13 +286,27 @@ class PLAAMLLMTrainer:
             ).to(self.device)
             
             input_ids = tokenized['input_ids']
+            
+            ignore_tokens = torch.full(
+                (input_ids.size(0), num_vision_tokens),
+                -100,
+                dtype=input_ids.dtype,
+                device=self.device
+            )
+            full_target_ids = torch.cat([ignore_tokens, input_ids], dim=1)
+            
             shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = input_ids[..., 1:].contiguous()
+            shift_labels = full_target_ids[..., 1:].contiguous()
             
             log_probs = F.log_softmax(shift_logits, dim=-1)
             log_probs = log_probs.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
             
-            return log_probs.mean()
+            valid_mask = (shift_labels != -100)
+            if valid_mask.sum() > 0:
+                log_probs = log_probs * valid_mask.float()
+                return log_probs.sum() / valid_mask.sum()
+            else:
+                return torch.tensor(0.0, device=self.device)
         
         return torch.tensor(0.0, device=self.device)
     
@@ -336,9 +374,11 @@ class PLAAMLLMTrainer:
                             mask = mask_data[i]
                     loss_dict = self.compute_loss_stage1(outputs, single_label_tensor, mask)
                 elif self.stage == 2:
-                    outputs = self.model(single_image, single_prompt)
                     single_info = {k: v[i] if isinstance(v, (list, tuple, torch.Tensor)) else v for k, v in annotation_info.items()}
-                    loss_dict = self.compute_loss_stage2(outputs, single_info, self.tokenizer)
+                    expert_explanation = single_info.get('expert_explanation', '')
+                    combined_text = single_prompt + " " + expert_explanation if expert_explanation else single_prompt
+                    outputs = self.model(single_image, combined_text)
+                    loss_dict = self.compute_loss_stage2(outputs, single_info, self.tokenizer, single_prompt)
                 elif self.stage == 3:
                     single_info = {k: v[i] if isinstance(v, (list, tuple, torch.Tensor)) else v for k, v in annotation_info.items()}
                     winner_text = single_info.get('winner', '')
