@@ -7,59 +7,116 @@ from configs.device_config import DeviceConfig
 
 
 class ForensicCrossAttention(nn.Module):
-    def __init__(self, config: ModelConfig, device_config: DeviceConfig):
+    def __init__(self, config, device_config):
         super().__init__()
         self.config = config
         self.device_config = device_config
-        self.latent_queries = None
-        self.cross_attention_layers = None
+        
+        self.num_latent_queries = config.num_latent_queries
+        self.latent_dim = config.latent_dim
+        
+        self._init_latent_queries()
+        
+        self.semantic_proj = nn.Linear(config.clip_dim, self.latent_dim)
+        self.artifact_projs = nn.ModuleList([
+            nn.Linear(dim, self.latent_dim) for dim in config.artifact_dims
+        ])
+        
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=self.latent_dim,
+            num_heads=config.num_attention_heads,
+            dropout=0.1,
+            batch_first=True
+        )
+        
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=self.latent_dim,
+            num_heads=config.num_attention_heads,
+            dropout=0.1,
+            batch_first=True
+        )
+        
+        self.ffn = nn.Sequential(
+            nn.Linear(self.latent_dim, self.latent_dim * 4),
+            nn.GELU(),
+            nn.Linear(self.latent_dim * 4, self.latent_dim),
+            nn.Dropout(0.1)
+        )
+        
+        self.norm1 = nn.LayerNorm(self.latent_dim)
+        self.norm2 = nn.LayerNorm(self.latent_dim)
+        self.norm3 = nn.LayerNorm(self.latent_dim)
+        
         self.text_guidance_proj = None
+        if config.use_text_guidance:
+            self.text_guidance_proj = nn.Linear(config.llm_dim, self.latent_dim)
 
-    def forward(
-        self,
-        semantic_features: Dict[str, torch.Tensor],
-        artifact_features: List[torch.Tensor],
-        text_guidance: Optional[torch.Tensor] = None
-    ) -&gt; torch.Tensor:
-        """
-        取证感知交叉注意力前向传播
+    def forward(self, semantic_features, artifact_features, text_guidance=None):
+        first_feat = list(semantic_features.values())[0]
+        device = first_feat.device
+        batch_size = first_feat.size(0)
+        
+        keys, values = self._align_features(semantic_features, artifact_features)
+        
+        queries = self.latent_queries.unsqueeze(0).repeat(batch_size, 1, 1)
+        
+        if text_guidance is not None and self.text_guidance_proj is not None:
+            text_proj = self.text_guidance_proj(text_guidance)
+            keys = torch.cat([keys, text_proj], dim=1)
+            values = torch.cat([values, text_proj], dim=1)
+        
+        attn_output, _ = self.cross_attention(
+            query=queries,
+            key=keys,
+            value=values
+        )
+        queries = self.norm1(queries + attn_output)
+        
+        self_attn_output, _ = self.self_attention(
+            query=queries,
+            key=queries,
+            value=queries
+        )
+        queries = self.norm2(queries + self_attn_output)
+        
+        ffn_output = self.ffn(queries)
+        queries = self.norm3(queries + ffn_output)
+        
+        return queries
 
-        Args:
-            semantic_features: 语义流特征字典，来自 DualStreamEncoder
-                - 包含 'layer_8', 'layer_16', 'layer_24' 等中间层特征
-            artifact_features: 伪影流特征列表，来自 DualStreamEncoder
-                - [高分辨率特征, 中分辨率特征, 低分辨率特征]
-            text_guidance: 可选的文本引导张量，形状 [B, T, D]，其中 T=token长度
+    def _init_latent_queries(self):
+        self.latent_queries = nn.Parameter(
+            torch.randn(self.num_latent_queries, self.latent_dim)
+        )
+        nn.init.trunc_normal_(self.latent_queries, std=0.02)
 
-        Returns:
-            torch.Tensor: 取证视觉令牌，形状 [B, N, D]
-                - B=batch_size, N=num_latent_queries, D=latent_query_dim
-        """
-        pass
+    def _align_features(self, semantic_features, artifact_features):
+        semantic_aligned = []
+        for layer_name, feat in semantic_features.items():
+            if feat.dim() == 3:
+                proj_feat = self.semantic_proj(feat)
+                semantic_aligned.append(proj_feat)
+        
+        artifact_aligned = []
+        num_projs = len(self.artifact_projs)
+        for idx, feat in enumerate(artifact_features):
+            if feat.dim() == 4:
+                B, C, H, W = feat.shape
+                feat = feat.flatten(2).transpose(1, 2)
+            if idx < num_projs:
+                proj_feat = self.artifact_projs[idx](feat)
+                artifact_aligned.append(proj_feat)
+        
+        all_features = semantic_aligned + artifact_aligned
+        
+        if all_features:
+            keys = torch.cat(all_features, dim=1)
+            values = keys
+        else:
+            first_feat = list(semantic_features.values())[0]
+            batch_size = first_feat.size(0)
+            keys = torch.zeros(batch_size, 1, self.latent_dim, device=first_feat.device)
+            values = keys
+        
+        return keys, values
 
-    def _init_latent_queries(self) -&gt; None:
-        """
-        初始化隐式查询向量 (Latent Queries)
-
-        生成形状为 [N, D] 的可学习参数，其中 N=num_latent_queries, D=latent_query_dim
-        """
-        pass
-
-    def _align_features(
-        self,
-        semantic_features: Dict[str, torch.Tensor],
-        artifact_features: List[torch.Tensor]
-    ) -&gt; Tuple[torch.Tensor, torch.Tensor]:
-        """
-        对齐语义流和伪影流特征，生成 Key 和 Value
-
-        Args:
-            semantic_features: 语义流特征字典
-            artifact_features: 伪影流特征列表
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - keys: 拼接后的 Key 张量，形状 [B, K, D]
-                - values: 拼接后的 Value 张量，形状 [B, K, D]
-        """
-        pass

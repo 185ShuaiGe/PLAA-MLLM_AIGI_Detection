@@ -1,0 +1,12 @@
+# 忽略所有目录下的 __pycache__ 文件夹（包括configs、models、utils下的）
+__pycache__/
+
+# 可选补充：忽略Python编译生成的字节码文件（和__pycache__配套，推荐添加）
+*.pyc
+*.pyo
+*.pyd
+
+# 可选：忽略Python虚拟环境/环境变量文件（如果有）
+.venv/
+env/
+.env

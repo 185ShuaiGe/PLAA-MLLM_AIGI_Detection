@@ -20,24 +20,13 @@ class AIGIDataset(Dataset):
     
     def __init__(
         self,
-        path_config: PathConfig,
-        model_config: ModelConfig,
-        stage: int = 1,
-        split: str = "train",
-        image_size: int = 224,
-        use_augmentation: bool = True
+        path_config,
+        model_config,
+        stage=1,
+        split="train",
+        image_size=224,
+        use_augmentation=True
     ):
-        """
-        初始化数据集
-        
-        Args:
-            path_config: 路径配置
-            model_config: 模型配置
-            stage: 训练阶段 (1, 2, 3)
-            split: 数据集划分 ("train", "val", "test")
-            image_size: 图像输入尺寸
-            use_augmentation: 是否使用数据增强
-        """
         self.path_config = path_config
         self.model_config = model_config
         self.stage = stage
@@ -55,13 +44,7 @@ class AIGIDataset(Dataset):
         
         self.logger.info(f"Loaded {len(self.samples)} samples for {split} split (stage {stage})")
     
-    def _load_annotations(self) -&gt; List[Dict[str, Any]]:
-        """
-        加载标注文件
-        
-        Returns:
-            List[Dict]: 样本列表
-        """
+    def _load_annotations(self):
         samples = []
         
         if os.path.exists(self.annotation_file):
@@ -78,13 +61,7 @@ class AIGIDataset(Dataset):
         
         return samples
     
-    def _generate_dummy_samples(self) -&gt; List[Dict[str, Any]]:
-        """
-        生成虚拟样本用于测试
-        
-        Returns:
-            List[Dict]: 虚拟样本列表
-        """
+    def _generate_dummy_samples(self):
         dummy_samples = []
         
         for i in range(10):
@@ -94,14 +71,14 @@ class AIGIDataset(Dataset):
                 "stage": self.stage
             }
             
-            if self.stage &gt;= 2:
+            if self.stage >= 2:
                 sample.update({
                     "text_query": "Is this image AI-generated?",
                     "mask": None,
                     "expert_explanation": "This image contains typical AI artifacts."
                 })
             
-            if self.stage &gt;= 3:
+            if self.stage >= 3:
                 sample.update({
                     "winner": "Yes, this image appears to be AI-generated due to inconsistent textures.",
                     "loser": "Maybe real?"
@@ -111,13 +88,7 @@ class AIGIDataset(Dataset):
         
         return dummy_samples
     
-    def _build_transform(self) -&gt; transforms.Compose:
-        """
-        构建图像变换 pipeline
-        
-        Returns:
-            transforms.Compose: 图像变换
-        """
+    def _build_transform(self):
         transform_list = []
         
         if self.use_augmentation:
@@ -139,25 +110,25 @@ class AIGIDataset(Dataset):
         
         return transforms.Compose(transform_list)
     
-    def __len__(self) -&gt; int:
-        """
-        获取数据集长度
+    def _build_mask_transform(self):
+        transform_list = []
         
-        Returns:
-            int: 样本数量
-        """
+        if self.use_augmentation:
+            transform_list.extend([
+                transforms.RandomResizedCrop(self.image_size, scale=(0.8, 1.0)),
+                transforms.RandomHorizontalFlip(p=0.5)
+            ])
+        else:
+            transform_list.append(transforms.Resize((self.image_size, self.image_size)))
+        
+        transform_list.append(transforms.ToTensor())
+        
+        return transforms.Compose(transform_list)
+    
+    def __len__(self):
         return len(self.samples)
     
-    def __getitem__(self, idx: int) -&gt; Tuple[torch.Tensor, Any, Dict[str, Any], str]:
-        """
-        获取单个样本
-        
-        Args:
-            idx: 样本索引
-        
-        Returns:
-            Tuple: (图像张量, 标签, 标注信息, 文本提示)
-        """
+    def __getitem__(self, idx):
         sample = self.samples[idx]
         
         try:
@@ -172,16 +143,7 @@ class AIGIDataset(Dataset):
         
         return image, label, annotation_info, text_prompt
     
-    def _load_image(self, image_path: str) -&gt; torch.Tensor:
-        """
-        加载并预处理图像
-        
-        Args:
-            image_path: 图像路径
-        
-        Returns:
-            torch.Tensor: 预处理后的图像张量
-        """
+    def _load_image(self, image_path):
         full_path = os.path.join(self.data_dir, image_path)
         
         if os.path.exists(full_path):
@@ -192,29 +154,47 @@ class AIGIDataset(Dataset):
         image_tensor = self.transform(image)
         return image_tensor
     
-    def _extract_annotation_info(self, sample: Dict[str, Any]) -&gt; Dict[str, Any]:
-        """
-        从样本中提取标注信息
+    def _load_mask(self, mask_path_or_data):
+        if mask_path_or_data is None:
+            return None
         
-        Args:
-            sample: 样本字典
-        
-        Returns:
-            Dict: 标注信息
-        """
+        try:
+            if isinstance(mask_path_or_data, str):
+                full_path = os.path.join(self.data_dir, mask_path_or_data)
+                if os.path.exists(full_path):
+                    mask = Image.open(full_path).convert("L")
+                else:
+                    mask = Image.fromarray(np.uint8(np.zeros((256, 256))))
+            elif isinstance(mask_path_or_data, np.ndarray):
+                mask = Image.fromarray(mask_path_or_data.astype(np.uint8))
+            else:
+                mask = Image.fromarray(np.uint8(np.zeros((256, 256))))
+            
+            mask_transform = self._build_mask_transform()
+            mask_tensor = mask_transform(mask)
+            
+            return mask_tensor
+        except Exception as e:
+            self.logger.warning(f"Failed to load mask: {e}")
+            return None
+    
+    def _extract_annotation_info(self, sample):
         info = {
             "image_path": sample.get("image_path", ""),
             "stage": sample.get("stage", self.stage)
         }
         
-        if self.stage &gt;= 2:
+        if self.stage >= 2:
+            mask_data = sample.get("mask")
+            mask_tensor = self._load_mask(mask_data)
+            
             info.update({
                 "text_query": sample.get("text_query", ""),
                 "expert_explanation": sample.get("expert_explanation", ""),
-                "mask": sample.get("mask")
+                "mask": mask_tensor
             })
         
-        if self.stage &gt;= 3:
+        if self.stage >= 3:
             info.update({
                 "winner": sample.get("winner", ""),
                 "loser": sample.get("loser", "")
@@ -222,19 +202,11 @@ class AIGIDataset(Dataset):
         
         return info
     
-    def _get_text_prompt(self, sample: Dict[str, Any]) -&gt; str:
-        """
-        获取文本提示
-        
-        Args:
-            sample: 样本字典
-        
-        Returns:
-            str: 文本提示
-        """
+    def _get_text_prompt(self, sample):
         if self.stage == 1:
             return "Classify this image as real or AI-generated."
         elif self.stage == 2:
             return sample.get("text_query", "Analyze this image.")
         else:
             return sample.get("text_query", "Which answer is better?")
+

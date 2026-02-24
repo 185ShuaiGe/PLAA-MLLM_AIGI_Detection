@@ -26,22 +26,12 @@ class PLAAMLLMTrainer:
     
     def __init__(
         self,
-        model: PLAAMLLM,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-        path_config: PathConfig,
-        stage: int = 1
+        model,
+        model_config,
+        device_config,
+        path_config,
+        stage=1
     ):
-        """
-        初始化训练器
-        
-        Args:
-            model: PLAA-MLLM 模型
-            model_config: 模型配置
-            device_config: 设备配置
-            path_config: 路径配置
-            stage: 训练阶段 (1, 2, 3)
-        """
         self.model = model
         self.model_config = model_config
         self.device_config = device_config
@@ -55,16 +45,28 @@ class PLAAMLLMTrainer:
         self.tokenizer = None
         self._init_tokenizer()
         
+        self.reference_model = None
+        if stage == 3:
+            self._init_reference_model()
+        
         self.best_metric = -float('inf')
         self.global_step = 0
         self.epoch = 0
         
         self._setup_stage()
     
-    def _init_tokenizer(self) -&gt; None:
-        """
-        初始化 Tokenizer
-        """
+    def _init_reference_model(self):
+        try:
+            import copy
+            self.reference_model = copy.deepcopy(self.model)
+            self.reference_model.eval()
+            for param in self.reference_model.parameters():
+                param.requires_grad = False
+            self.logger.info("Reference model initialized for DPO training")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize reference model: {e}")
+    
+    def _init_tokenizer(self):
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_config.llm_model_name)
             if self.tokenizer.pad_token is None:
@@ -72,10 +74,7 @@ class PLAAMLLMTrainer:
         except Exception as e:
             self.logger.warning(f"Failed to load tokenizer: {e}")
     
-    def _setup_stage(self) -&gt; None:
-        """
-        根据训练阶段设置参数冻结策略
-        """
+    def _setup_stage(self):
         self.logger.info(f"Setting up training stage {self.stage}")
         
         if self.stage == 1:
@@ -87,10 +86,7 @@ class PLAAMLLMTrainer:
         elif self.stage == 3:
             self.logger.info("Stage 3: DPO training, keeping previous setup")
     
-    def _freeze_clip_llm(self) -&gt; None:
-        """
-        冻结 CLIP 语义流和 LLM 主干网络 (Stage 1)
-        """
+    def _freeze_clip_llm(self):
         self.logger.info("Freezing CLIP semantic stream and LLM backbone")
         
         if hasattr(self.model, 'dual_stream_encoder'):
@@ -106,10 +102,7 @@ class PLAAMLLMTrainer:
         trainable_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         self.logger.info(f"Trainable parameters after freezing: {trainable_count:,}")
     
-    def _unfreeze_artifact_adapter(self) -&gt; None:
-        """
-        解冻伪影流和交叉注意力适配器 (Stage 1)
-        """
+    def _unfreeze_artifact_adapter(self):
         self.logger.info("Unfreezing artifact stream and cross-attention adapter")
         
         if hasattr(self.model, 'dual_stream_encoder'):
@@ -124,10 +117,7 @@ class PLAAMLLMTrainer:
         trainable_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         self.logger.info(f"Trainable parameters after unfreezing: {trainable_count:,}")
     
-    def _freeze_visual_streams(self) -&gt; None:
-        """
-        冻结所有视觉流 (Stage 2)
-        """
+    def _freeze_visual_streams(self):
         self.logger.info("Freezing all visual streams")
         
         if hasattr(self.model, 'dual_stream_encoder'):
@@ -137,10 +127,7 @@ class PLAAMLLMTrainer:
         trainable_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         self.logger.info(f"Trainable parameters after freezing visual streams: {trainable_count:,}")
     
-    def _apply_lora(self) -&gt; None:
-        """
-        为 LLM 应用 LoRA (Stage 2)
-        """
+    def _apply_lora(self):
         self.logger.info(f"Applying LoRA with rank={self.model_config.lora_rank}")
         
         if hasattr(self.model, 'llm_infer') and hasattr(self.model.llm_infer, 'llm_model'):
@@ -166,29 +153,13 @@ class PLAAMLLMTrainer:
                 except Exception as e:
                     self.logger.warning(f"Failed to apply LoRA: {e}")
     
-    def compute_loss_stage1(
-        self,
-        outputs: Dict[str, Any],
-        labels: torch.Tensor,
-        masks: Optional[torch.Tensor] = None
-    ) -&gt; Dict[str, torch.Tensor]:
-        """
-        计算 Stage 1 损失：BCE Loss + DICE Loss
-        
-        Args:
-            outputs: 模型输出
-            labels: 分类标签
-            masks: 可选的定位掩码
-        
-        Returns:
-            Dict: 损失字典
-        """
+    def compute_loss_stage1(self, outputs, labels, masks=None):
         loss_dict = {}
         
         detection_logits = outputs.get('detection_logits', None)
         if detection_logits is not None:
             labels = labels.to(self.device).float()
-            if detection_logits.dim() &gt; 1:
+            if detection_logits.dim() > 1:
                 detection_logits = detection_logits.view(-1)
             bce_loss = F.binary_cross_entropy_with_logits(detection_logits, labels)
             loss_dict['bce_loss'] = bce_loss
@@ -208,41 +179,14 @@ class PLAAMLLMTrainer:
         
         return loss_dict
     
-    def _dice_loss(self, pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-6) -&gt; torch.Tensor:
-        """
-        计算 DICE Loss
-        
-        Args:
-            pred: 预测掩码
-            target: 真实掩码
-            smooth: 平滑项
-        
-        Returns:
-            torch.Tensor: DICE 损失
-        """
+    def _dice_loss(self, pred, target, smooth=1e-6):
         pred = torch.sigmoid(pred)
         intersection = (pred * target).sum()
         union = pred.sum() + target.sum()
         dice = (2. * intersection + smooth) / (union + smooth)
         return 1 - dice
     
-    def compute_loss_stage2(
-        self,
-        outputs: Dict[str, Any],
-        labels: Dict[str, Any],
-        tokenizer: Optional[Any] = None
-    ) -&gt; Dict[str, torch.Tensor]:
-        """
-        计算 Stage 2 损失：Causal Language Modeling Loss
-        
-        Args:
-            outputs: 模型输出
-            labels: 标签字典
-            tokenizer: 可选的 tokenizer
-        
-        Returns:
-            Dict: 损失字典
-        """
+    def compute_loss_stage2(self, outputs, labels, tokenizer=None):
         logits = outputs.get('logits', None)
         
         if logits is not None:
@@ -268,52 +212,55 @@ class PLAAMLLMTrainer:
         
         return {'total_loss': torch.tensor(0.0, device=self.device, requires_grad=True)}
     
-    def compute_loss_stage3(
-        self,
-        outputs_winner: Dict[str, Any],
-        outputs_loser: Dict[str, Any],
-        beta: float = 0.1
-    ) -&gt; Dict[str, torch.Tensor]:
-        """
-        计算 Stage 3 损失：DPO Loss
-        
-        Args:
-            outputs_winner: Winner 回答的模型输出
-            outputs_loser: Loser 回答的模型输出
-            beta: DPO beta 参数
-        
-        Returns:
-            Dict: 损失字典
-        """
-        winner_log_probs = outputs_winner.get('log_probs', None)
-        loser_log_probs = outputs_loser.get('log_probs', None)
-        
-        if winner_log_probs is not None and loser_log_probs is not None:
-            dpo_loss = -F.logsigmoid(beta * (winner_log_probs - loser_log_probs)).mean()
+    def compute_loss_stage3(self, image, winner_text, loser_text, beta=0.1):
+        try:
+            policy_winner_log_prob = self._compute_log_prob(self.model, image, winner_text)
+            policy_loser_log_prob = self._compute_log_prob(self.model, image, loser_text)
+            
+            if self.reference_model is not None:
+                with torch.no_grad():
+                    ref_winner_log_prob = self._compute_log_prob(self.reference_model, image, winner_text)
+                    ref_loser_log_prob = self._compute_log_prob(self.reference_model, image, loser_text)
+            else:
+                ref_winner_log_prob = policy_winner_log_prob.detach()
+                ref_loser_log_prob = policy_loser_log_prob.detach()
+            
+            policy_logratios = policy_winner_log_prob - policy_loser_log_prob
+            ref_logratios = ref_winner_log_prob - ref_loser_log_prob
+            
+            logits = policy_logratios - ref_logratios
+            dpo_loss = -F.logsigmoid(beta * logits).mean()
+            
             return {'dpo_loss': dpo_loss, 'total_loss': dpo_loss}
-        
-        return {'total_loss': torch.tensor(0.0, device=self.device, requires_grad=True)}
+        except Exception as e:
+            self.logger.warning(f"Failed to compute DPO loss: {e}")
+            return {'total_loss': torch.tensor(0.0, device=self.device, requires_grad=True)}
     
-    def train(
-        self,
-        train_loader: DataLoader,
-        val_loader: Optional[DataLoader] = None,
-        num_epochs: int = 10,
-        learning_rate: float = 1e-4,
-        batch_size: int = 8,
-        checkpoint_path: Optional[str] = None
-    ) -&gt; None:
-        """
-        训练主循环
+    def _compute_log_prob(self, model, image, text):
+        outputs = model(image, text)
+        logits = outputs.get('logits')
         
-        Args:
-            train_loader: 训练数据加载器
-            val_loader: 验证数据加载器
-            num_epochs: 训练轮数
-            learning_rate: 学习率
-            batch_size: 批次大小
-            checkpoint_path: 断点续训路径
-        """
+        if logits is not None and self.tokenizer is not None:
+            tokenized = self.tokenizer(
+                text,
+                return_tensors='pt',
+                padding=True,
+                truncation=True,
+                max_length=self.model_config.max_seq_len
+            ).to(self.device)
+            
+            input_ids = tokenized['input_ids']
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = input_ids[..., 1:].contiguous()
+            
+            log_probs = F.log_softmax(shift_logits, dim=-1)
+            log_probs = log_probs.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
+            
+            return log_probs.mean()
+        
+        return torch.tensor(0.0, device=self.device)
+    
+    def train(self, train_loader, val_loader=None, num_epochs=10, learning_rate=1e-4, batch_size=8, checkpoint_path=None):
         self.logger.info(f"Starting training stage {self.stage}")
         
         optimizer = AdamW(
@@ -338,24 +285,14 @@ class PLAAMLLMTrainer:
                 val_loss = self._validate_epoch(val_loader)
                 self.logger.info(f"Val Loss: {val_loss:.4f}")
                 
-                if val_loss &lt; self.best_metric or self.best_metric == -float('inf'):
+                if val_loss < self.best_metric or self.best_metric == -float('inf'):
                     self.best_metric = val_loss
                     self._save_checkpoint(optimizer, scheduler, is_best=True)
             
             scheduler.step()
             self._save_checkpoint(optimizer, scheduler, is_best=False)
     
-    def _train_epoch(self, loader: DataLoader, optimizer: torch.optim.Optimizer) -&gt; float:
-        """
-        训练一个 epoch
-        
-        Args:
-            loader: 数据加载器
-            optimizer: 优化器
-        
-        Returns:
-            float: 平均训练损失
-        """
+    def _train_epoch(self, loader, optimizer):
         self.model.train()
         total_loss = 0.0
         
@@ -373,26 +310,28 @@ class PLAAMLLMTrainer:
             
             for i in range(batch_size_local):
                 single_image = images[i:i+1]
-                single_prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
-                
-                outputs = self.model(single_image, single_prompt)
-                batch_outputs.append(outputs)
+                single_prompt = text_prompts[i] if isinstance(text_prompts, (list, tuple)) else text_prompts
                 
                 if self.stage == 1:
+                    outputs = self.model(single_image, single_prompt)
                     single_label = labels[i:i+1] if isinstance(labels, torch.Tensor) else [labels[i]]
                     single_label_tensor = torch.tensor([single_label], device=self.device) if not isinstance(labels, torch.Tensor) else single_label
-                    loss_dict = self.compute_loss_stage1(outputs, single_label_tensor)
+                    
+                    mask = None
+                    if isinstance(annotation_info, dict):
+                        mask_data = annotation_info.get('mask')
+                        if isinstance(mask_data, (list, tuple)) and i < len(mask_data):
+                            mask = mask_data[i]
+                    loss_dict = self.compute_loss_stage1(outputs, single_label_tensor, mask)
                 elif self.stage == 2:
-                    single_info = {k: v[i] if isinstance(v, (list, torch.Tensor)) else v for k, v in annotation_info.items()}
+                    outputs = self.model(single_image, single_prompt)
+                    single_info = {k: v[i] if isinstance(v, (list, tuple, torch.Tensor)) else v for k, v in annotation_info.items()}
                     loss_dict = self.compute_loss_stage2(outputs, single_info, self.tokenizer)
                 elif self.stage == 3:
-                    single_info = {k: v[i] if isinstance(v, (list, torch.Tensor)) else v for k, v in annotation_info.items()}
+                    single_info = {k: v[i] if isinstance(v, (list, tuple, torch.Tensor)) else v for k, v in annotation_info.items()}
                     winner_text = single_info.get('winner', '')
                     loser_text = single_info.get('loser', '')
-                    
-                    outputs_winner = self.model(single_image, winner_text)
-                    outputs_loser = self.model(single_image, loser_text)
-                    loss_dict = self.compute_loss_stage3(outputs_winner, outputs_loser)
+                    loss_dict = self.compute_loss_stage3(single_image, winner_text, loser_text)
                 
                 batch_losses.append(loss_dict['total_loss'])
             
@@ -407,16 +346,7 @@ class PLAAMLLMTrainer:
         
         return total_loss / len(loader)
     
-    def _validate_epoch(self, loader: DataLoader) -&gt; float:
-        """
-        验证一个 epoch
-        
-        Args:
-            loader: 数据加载器
-        
-        Returns:
-            float: 平均验证损失
-        """
+    def _validate_epoch(self, loader):
         self.model.eval()
         total_loss = 0.0
         
@@ -430,16 +360,22 @@ class PLAAMLLMTrainer:
                 
                 for i in range(batch_size_local):
                     single_image = images[i:i+1]
-                    single_prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
+                    single_prompt = text_prompts[i] if isinstance(text_prompts, (list, tuple)) else text_prompts
                     
                     outputs = self.model(single_image, single_prompt)
                     
                     if self.stage == 1:
                         single_label = labels[i:i+1] if isinstance(labels, torch.Tensor) else [labels[i]]
                         single_label_tensor = torch.tensor([single_label], device=self.device) if not isinstance(labels, torch.Tensor) else single_label
-                        loss_dict = self.compute_loss_stage1(outputs, single_label_tensor)
+                        
+                        mask = None
+                        if isinstance(annotation_info, dict):
+                            mask_data = annotation_info.get('mask')
+                            if isinstance(mask_data, (list, tuple)) and i < len(mask_data):
+                                mask = mask_data[i]
+                        loss_dict = self.compute_loss_stage1(outputs, single_label_tensor, mask)
                     elif self.stage == 2:
-                        single_info = {k: v[i] if isinstance(v, (list, torch.Tensor)) else v for k, v in annotation_info.items()}
+                        single_info = {k: v[i] if isinstance(v, (list, tuple, torch.Tensor)) else v for k, v in annotation_info.items()}
                         loss_dict = self.compute_loss_stage2(outputs, single_info, self.tokenizer)
                     else:
                         loss_dict = {'total_loss': torch.tensor(0.0, device=self.device)}
@@ -451,20 +387,7 @@ class PLAAMLLMTrainer:
         
         return total_loss / len(loader)
     
-    def _save_checkpoint(
-        self,
-        optimizer: torch.optim.Optimizer,
-        scheduler: torch.optim.lr_scheduler._LRScheduler,
-        is_best: bool = False
-    ) -&gt; None:
-        """
-        保存检查点
-        
-        Args:
-            optimizer: 优化器
-            scheduler: 学习率调度器
-            is_best: 是否为最优模型
-        """
+    def _save_checkpoint(self, optimizer, scheduler, is_best=False):
         checkpoint = {
             'epoch': self.epoch,
             'global_step': self.global_step,
@@ -491,20 +414,7 @@ class PLAAMLLMTrainer:
             torch.save(checkpoint, best_path)
             self.logger.info(f"Best checkpoint saved to {best_path}")
     
-    def _load_checkpoint(
-        self,
-        checkpoint_path: str,
-        optimizer: torch.optim.Optimizer,
-        scheduler: torch.optim.lr_scheduler._LRScheduler
-    ) -&gt; None:
-        """
-        加载检查点
-        
-        Args:
-            checkpoint_path: 检查点路径
-            optimizer: 优化器
-            scheduler: 学习率调度器
-        """
+    def _load_checkpoint(self, checkpoint_path, optimizer, scheduler):
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
@@ -516,3 +426,4 @@ class PLAAMLLMTrainer:
         
         self.logger.info(f"Checkpoint loaded from {checkpoint_path}")
         self.logger.info(f"Resuming from epoch {self.epoch}, step {self.global_step}")
+
