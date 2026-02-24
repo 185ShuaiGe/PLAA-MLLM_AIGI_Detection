@@ -1,7 +1,7 @@
 
 class ModelConfig:
     clip_model_name = "openai/clip-vit-large-patch14"
-    clip_dim = 768
+    clip_dim = 1024
     clip_intermediate_layers = [8, 16, 24]
     resnet_depth = 50
     fpn_channels = 256

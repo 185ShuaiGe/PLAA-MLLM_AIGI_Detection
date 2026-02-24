@@ -75,7 +75,6 @@ class PLAAMLLM(nn.Module):
                 tokenized = self.llm_infer.tokenizer(
                     text_prompt,
                     return_tensors='pt',
-                    padding=True,
                     truncation=True,
                     max_length=self.model_config.max_seq_len
                 ).to(image.device)

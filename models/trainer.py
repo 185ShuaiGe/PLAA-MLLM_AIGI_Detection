@@ -203,7 +203,6 @@ class PLAAMLLMTrainer:
                 tokenized_full = tokenizer(
                     full_text,
                     max_length=self.model_config.max_seq_len,
-                    padding='max_length',
                     truncation=True,
                     return_tensors='pt'
                 )
@@ -217,21 +216,18 @@ class PLAAMLLMTrainer:
                     )
                     num_prompt_tokens = tokenized_prompt['input_ids'].size(1)
                 
+                target_ids = full_target_ids.clone()
+                if num_prompt_tokens > 0 and num_prompt_tokens < target_ids.size(1):
+                    target_ids[0, :num_prompt_tokens] = -100
+                
                 ignore_vision = torch.full(
-                    (full_target_ids.size(0), num_vision_tokens),
+                    (target_ids.size(0), num_vision_tokens),
                     -100,
-                    dtype=full_target_ids.dtype,
+                    dtype=target_ids.dtype,
                     device=self.device
                 )
                 
-                ignore_prompt = torch.full(
-                    (full_target_ids.size(0), num_prompt_tokens),
-                    -100,
-                    dtype=full_target_ids.dtype,
-                    device=self.device
-                )
-                
-                target_mask = torch.cat([ignore_vision, ignore_prompt, full_target_ids], dim=1)
+                target_mask = torch.cat([ignore_vision, target_ids], dim=1)
                 
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = target_mask[..., 1:].contiguous()
@@ -280,7 +276,6 @@ class PLAAMLLMTrainer:
             tokenized = self.tokenizer(
                 text,
                 return_tensors='pt',
-                padding=True,
                 truncation=True,
                 max_length=self.model_config.max_seq_len
             ).to(self.device)
