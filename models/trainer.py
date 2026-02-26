@@ -95,9 +95,12 @@ class PLAAMLLMTrainer:
                     param.requires_grad = False
         
         if hasattr(self.model, 'llm_infer'):
-            if hasattr(self.model.llm_infer, 'llm_model'):
-                for param in self.model.llm_infer.llm_model.parameters():
-                    param.requires_grad = False
+                # 增加对 llm_model 是否为 None 的检查
+                if hasattr(self.model.llm_infer, 'llm_model') and self.model.llm_infer.llm_model is not None:
+                    for param in self.model.llm_infer.llm_model.parameters():
+                        param.requires_grad = False
+                else:
+                    self.logger.warning("llm_model is None, skipping freeze.")
         
         trainable_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         self.logger.info(f"Trainable parameters after freezing: {trainable_count:,}")

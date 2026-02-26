@@ -13,7 +13,19 @@ class LLMInference(nn.Module):
         super().__init__()
         self.config = config
         self.device_config = device_config
-        self.llm_model = None
+        # --- 修改部分：增加模型加载逻辑 ---
+        try:
+            from transformers import AutoModelForCausalLM
+            print(f"Loading LLM from {config.llm_model_name}...")
+            self.llm_model = AutoModelForCausalLM.from_pretrained(
+                config.llm_model_name,
+                torch_dtype=torch.float16, # 建议使用半精度节省显存
+                device_map="auto"          # 自动分配设备
+            )
+        except Exception as e:
+            print(f"Error loading LLM: {e}")
+            self.llm_model = None 
+        # ------------------------------
         self.tokenizer = None
         self.lora_config = None
         
@@ -25,7 +37,7 @@ class LLMInference(nn.Module):
         初始化 Tokenizer
         """
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.config.llm_model_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.config.llm_model_name, legacy=False)
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
         except Exception as e:
