@@ -145,22 +145,36 @@ class PLAAMLLM(nn.Module):
         return inputs_embeds, fused_attention_mask
 
     def load_checkpoint(self, checkpoint_path):
-            try:
-                checkpoint = torch.load(checkpoint_path, map_location=self.device_config.get_device())
-                state_dict = checkpoint.get('model_state_dict', checkpoint)
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device_config.get_device())
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            
+            filtered_state_dict = {}
+            for k, v in state_dict.items():
+                # 1. 自动剥离多卡训练 (DDP) 产生的 module. 前缀，或 torch.compile 产生的 _orig_mod. 前缀
+                clean_k = k.replace('module.', '').replace('_orig_mod.', '')
                 
-                # 【核心修复】：在主模型加载时，同样过滤掉 LLM 的 4-bit 量化权重
-                filtered_state_dict = {
-                    k: v for k, v in state_dict.items() 
-                    if not k.startswith('llm_infer.llm_model.')
-                }
-                
-                # 加载过滤后的权重
-                self.load_state_dict(filtered_state_dict, strict=False)
-                print("Checkpoint successfully loaded (LLM weights ignored).")
-                
-            except Exception as e:
-                print(f"Error loading checkpoint in PLAAMLLM: {e}")
+                # 2. 过滤掉 LLM 冻结的主干权重，但必须保留 LoRA 权重
+                if clean_k.startswith('llm_infer.llm_model.') and 'lora' not in clean_k:
+                    continue
+                    
+                filtered_state_dict[clean_k] = v
+            
+            # 3. 加载过滤并清理前缀后的权重，并捕获返回值
+            res = self.load_state_dict(filtered_state_dict, strict=False)
+            print(f"[{checkpoint_path}] Checkpoint successfully loaded.")
+            
+            # ================= 核心伤情诊断：检查视觉流是否加载成功 =================
+            vision_missing = [k for k in res.missing_keys if 'dual_stream' in k or 'detection_head' in k]
+            if vision_missing:
+                print(f"🚨 严重警告: 共有 {len(vision_missing)} 个视觉/分类参数未能对齐加载！")
+                print(f"🚨 示例缺失项: {vision_missing[:3]}")
+            else:
+                print("✅ 视觉编码器 (Dual Stream) 和分类头 (Detection Head) 权重已完美挂载！")
+            # =======================================================================
+            
+        except Exception as e:
+            print(f"Error loading checkpoint in PLAAMLLM: {e}")
 
     def save_checkpoint(self, checkpoint_path):
         try:

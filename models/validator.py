@@ -76,14 +76,19 @@ class PLAAMLLMValidator:
                 for i in range(len(images)):
                     single_image = images[i:i+1]
                     single_label = labels[i] if isinstance(labels, torch.Tensor) else labels[i]
-                    single_info = {k: v[i] if isinstance(v, (list, torch.Tensor)) else v for k, v in annotation_info.items()}
-                    single_prompt = text_prompts[i] if isinstance(text_prompts, list) else text_prompts
-                    
+                    single_info = {}
+                    for k, v in annotation_info.items():
+                        val = v[i] if isinstance(v, (list, tuple, torch.Tensor)) else v
+                        # 如果提取出来的是 Tensor，将其转换为普通的 Python 数据类型（int/float/list）
+                        if isinstance(val, torch.Tensor):
+                            val = val.item() if val.numel() == 1 else val.cpu().tolist()
+                        single_info[k] = val                    
+                        single_prompt = text_prompts[i] if isinstance(text_prompts, (list, tuple)) else text_prompts                    
                     result = self._validate_single(single_image, single_label, single_info, single_prompt)
                     self.results.append(result)
         
-        if save_results:
-            self._save_results(output_dir)
+        # if save_results:
+        #     self._save_results(output_dir)
         
         return self._aggregate_results()
     

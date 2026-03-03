@@ -17,12 +17,13 @@ from configs.model_config import ModelConfig
 from configs.device_config import DeviceConfig
 from configs.path_config import PathConfig
 from models.plaa_mllm import PLAAMLLM
-from data.dataset_loader import AIGIDataset
+from data.dataset_loader import AIGIDataset, val_AIGIDataset
 from models.trainer import PLAAMLLMTrainer
 from models.validator import PLAAMLLMValidator
 from utils.metrics_utils import MetricsCalculator
 from utils.log_utils import Logger
 from torchvision import transforms
+from peft import LoraConfig, get_peft_model
 
 
 def parse_args() -> Namespace:
@@ -100,8 +101,27 @@ def main() -> None:
 
     logger = Logger(name="PLAA_MLLM_Main", log_dir=path_config.logs_dir)
 
+    # 1. 实例化基础模型
     model = PLAAMLLM(model_config, device_config, path_config)
 
+    # =========================================================================
+    # 【核心修复】：如果是验证/测试阶段，必须先注入 LoRA 架构，才能接住 checkpoint 里的 LoRA 权重！
+    # =========================================================================
+    if args.mode in ['val', 'test']: 
+        logger.info("Applying LoRA architecture for validation/testing...")
+        if hasattr(model, 'llm_infer') and hasattr(model.llm_infer, 'llm_model'):
+            lora_config = LoraConfig(
+                r=model_config.lora_rank,
+                lora_alpha=model_config.lora_alpha,
+                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+                lora_dropout=0.05,
+                bias="none",
+                task_type="CAUSAL_LM"
+            )
+            # 给验证模型也包上 LoRA
+            model.llm_infer.llm_model = get_peft_model(model.llm_infer.llm_model, lora_config)
+            logger.info("LoRA architecture applied successfully.")
+    # =========================================================================
     # 单卡训练
     # device = device_config.get_device()
     # model = model.to(device)
@@ -120,6 +140,37 @@ def main() -> None:
     if args.checkpoint and os.path.exists(args.checkpoint):
         logger.info(f"Loading checkpoint from {args.checkpoint}")
         model.load_checkpoint(args.checkpoint)
+        # ==================== 终极诊断与强制加载代码 ====================
+        print("\n" + "="*60)
+        print("🔍 开始强制诊断与提取 LoRA 权重...")
+        
+        # 1. 重新独立读取一次权重文件，防止被 plaa_mllm 的内部机制过滤
+        ckpt = torch.load(args.checkpoint, map_location='cpu')
+        state_dict = ckpt.get('model_state_dict', ckpt)
+        
+        # 2. 暴力提取所有名字里带 'lora' 的参数
+        lora_weights = {k: v for k, v in state_dict.items() if 'lora' in k}
+        print(f"1. 在文件 {args.checkpoint} 中，共发现 {len(lora_weights)} 个 LoRA 参数。")
+        
+        if len(lora_weights) > 0:
+            # 3. 强行将这部分参数灌入当前模型
+            res = model.load_state_dict(lora_weights, strict=False)
+            missing_lora = [k for k in res.missing_keys if 'lora' in k]
+            print(f"2. 强制挂载执行完毕。未能成功对齐的 LoRA 参数数量: {len(missing_lora)}")
+            
+            # 4. 核心验伤：检查 LoRA B 矩阵
+            # 原理：LoRA 训练前，B矩阵默认全为0。如果这里求和为0，说明你第二阶段训练根本没更新参数！
+            lora_b_sum = sum(p.abs().sum().item() for n, p in model.named_parameters() if 'lora_B' in n)
+            print(f"3. 当前模型中 LoRA_B 的权重绝对值之和为: {lora_b_sum}")
+            
+            if lora_b_sum == 0.0:
+                print("🚨 致命异常：LoRA_B 权重全为 0！说明你第二阶段训练时代码有 Bug，梯度根本没传给 LoRA！")
+            else:
+                print("✅ LoRA 权重已成功激活并生效！")
+        else:
+            print("🚨 致命异常：权重文件中根本不存在任何 LoRA 权重！(可能是保存时没用 peft 的机制)")
+        print("="*60 + "\n")
+        # ================================================================
 
     if args.mode == "train":
         train(model, args, logger, model_config, device_config, path_config)
@@ -193,8 +244,17 @@ def validate(
     """
     logger.info("Starting validation")
 
-    val_dataset = AIGIDataset(
-        path_config, model_config, stage=1, split="val", use_augmentation=False)
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],
+            std=[0.26862954, 0.26130258, 0.27577711]
+        )
+    ])
+
+    val_dataset = val_AIGIDataset(
+        path_config.TEST_DATA_DIR, transform=transform)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
     validator = PLAAMLLMValidator(model, model_config, device_config, path_config)

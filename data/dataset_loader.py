@@ -214,3 +214,45 @@ class AIGIDataset(Dataset):
         else:
             return sample.get("text_query", "Which answer is better?")
 
+class val_AIGIDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.image_paths = []
+        self.labels = []
+        self.transform = transform
+        
+        # 遍历 20 个类别子文件夹
+        for category in os.listdir(root_dir):
+            category_path = os.path.join(root_dir, category)
+            if not os.path.isdir(category_path):
+                continue
+                
+            # 遍历 0_real 和 1_fake
+            for label_dir in ['0_real', '1_fake']:
+                label_path = os.path.join(category_path, label_dir)
+                if not os.path.isdir(label_path):
+                    continue
+                
+                # 设定标签：0_real 为 0 (真实), 1_fake 为 1 (虚假)
+                label = 0 if '0_real' in label_dir else 1
+                
+                # 获取所有图片
+                for img_name in os.listdir(label_path):
+                    self.image_paths.append(os.path.join(label_path, img_name))
+                    self.labels.append(label)
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert('RGB')
+        label = self.labels[idx]
+        
+        if self.transform:
+            image = self.transform(image)
+            
+        # 补充空字典和默认的文本 prompt，凑齐 4 个返回值，防止 Validator 解包报错
+        dummy_info = {"image_path": img_path, "stage": 2}
+        default_prompt = "<image>\nAnalyze this image and determine if it is real or AI-generated. Please provide your reasoning." 
+            
+        return image, label, dummy_info, default_prompt

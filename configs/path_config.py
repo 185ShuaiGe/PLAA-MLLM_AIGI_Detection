@@ -20,3 +20,7 @@ class PathConfig:
 
 
     checkpoint_path = os.path.join(weights_dir, "plaa_mllm_checkpoint.pt")
+
+    # 在 configs/path_config.py 中，用于测试的路径
+    TEST_DATA_DIR = "/data/Disk_A/wangxinchang/Datasets/val/progan"
+    CHECKPOINT_PATH = "/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/PLAA-MLLM_AIGI_Detection/weights/checkpoint_stage2_best.pt"
