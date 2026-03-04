@@ -1,4 +1,3 @@
-
 import os
 import torch
 import torch.nn as nn
@@ -17,6 +16,7 @@ from models.plaa_mllm import PLAAMLLM
 from data.dataset_loader import AIGIDataset
 from utils.log_utils import Logger
 from utils.device_utils import DeviceManager
+from utils.metrics_utils import MetricsCalculator
 
 
 class PLAAMLLMTrainer:
@@ -41,6 +41,8 @@ class PLAAMLLMTrainer:
         self.logger = Logger(name=f"Trainer_Stage{stage}")
         self.device_manager = DeviceManager(device_config)
         self.device = device_config.get_device()
+
+        self.metrics_calculator = MetricsCalculator(path_config)
         
         self.tokenizer = None
         self._init_tokenizer()
@@ -321,7 +323,7 @@ class PLAAMLLMTrainer:
         
         return torch.tensor(0.0, device=self.device)
     
-    def train(self, train_loader, val_loader=None, num_epochs=10, learning_rate=1e-4, batch_size=8, checkpoint_path=None):
+    def train(self, train_loader, val_loader=None, num_epochs=3, learning_rate=1e-4, batch_size=4, checkpoint_path=None):
         self.logger.info(f"Starting training stage {self.stage}")
         
         optimizer = AdamW(
@@ -329,32 +331,78 @@ class PLAAMLLMTrainer:
             lr=learning_rate,
             weight_decay=0.01
         )
-        
         scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
         
         if checkpoint_path and os.path.exists(checkpoint_path):
             self._load_checkpoint(checkpoint_path, optimizer, scheduler)
         
+        # 用于保存每个 Epoch 数据的历史字典
+        history = {'train_loss': [], 'val_loss': [], 'val_auc': []}
+        
+        # 用于记录最后一次的验证结果，供给 ROC/PR 曲线绘图
+        last_metrics = {}
+        last_true_labels = []
+        last_pred_scores = []
+        
         for epoch in range(self.epoch, num_epochs):
             self.epoch = epoch
             self.logger.info(f"Epoch {epoch + 1}/{num_epochs}")
             
+            # 1. 训练一轮
             train_loss = self._train_epoch(train_loader, optimizer)
             self.logger.info(f"Train Loss: {train_loss:.4f}")
+            history['train_loss'].append(train_loss)
             
+            # 2. 验证一轮
             if val_loader is not None:
-                val_loss = self._validate_epoch(val_loader)
+                val_loss, true_labels, pred_scores = self._validate_epoch(val_loader)
                 self.logger.info(f"Val Loss: {val_loss:.4f}")
+                history['val_loss'].append(val_loss)
                 
+                if self.stage == 1 and len(true_labels) > 0 and len(pred_scores) > 0:
+                    metrics = self.metrics_calculator.calculate_all_metrics(true_labels, pred_scores)
+                    val_auc = metrics.get('auc_roc', 0.0)
+                    self.logger.info(f"Val AUC: {val_auc:.4f}")
+                    
+                    history['val_auc'].append(val_auc)
+                    # 缓存最后一轮的数据用于出图
+                    last_metrics = metrics
+                    last_true_labels = true_labels
+                    last_pred_scores = pred_scores
+                else:
+                    history['val_auc'].append(0.0)
+                
+                # 保存最佳模型
                 if val_loss < self.best_metric or self.best_metric == -float('inf'):
                     self.best_metric = val_loss
                     self._save_checkpoint(optimizer, scheduler, is_best=True)
             
             scheduler.step()
             self._save_checkpoint(optimizer, scheduler, is_best=False)
-    
+            
+        # ==================== 【利用 metrics_utils 生成可视化】 ====================
+        self.logger.info("Training completed. Generating all visualizations...")
+        # 1. 生成 Loss 和 AUC 的变化曲线图
+        if self.stage == 1:
+            self.metrics_calculator.plot_training_history(history)
+            
+        # 2. 利用已有函数生成最后一轮的 ROC 曲线、PR 曲线和柱状图
+        if last_true_labels and last_pred_scores:
+            self.metrics_calculator.visualize_metrics(last_metrics, last_true_labels, last_pred_scores)
+        # =========================================================================
+        
+        return history
+
     def _train_epoch(self, loader, optimizer):
         self.model.train()
+        # ==================== 【修复核心】 ====================
+        # 强制将模型中所有的 BatchNorm 锁定在 eval 模式，防止 BS=1 污染统计量
+        def set_bn_eval(m):
+            classname = m.__class__.__name__
+            if classname.find('BatchNorm') != -1:
+                m.eval()
+        self.model.apply(set_bn_eval)
+        # ====================================================
         total_loss = 0.0
         
         progress_bar = tqdm(loader, desc=f"Training Stage {self.stage}")
@@ -412,6 +460,65 @@ class PLAAMLLMTrainer:
         return total_loss / len(loader)
     
     def _validate_epoch(self, loader):
+        self.model.eval()
+        total_loss = 0.0
+        
+        # 新增：用于收集本轮所有验证数据的真实标签和预测分数
+        all_true_labels = []
+        all_pred_scores = []
+        
+        with torch.no_grad():
+            for batch in tqdm(loader, desc="Validating"):
+                images, labels, annotation_info, text_prompts = batch
+                images = images.to(self.device)
+                
+                batch_size_local = images.size(0)
+                batch_losses = []
+                
+                for i in range(batch_size_local):
+                    single_image = images[i:i+1]
+                    single_prompt = text_prompts[i] if isinstance(text_prompts, (list, tuple)) else text_prompts
+                    
+                    if self.stage == 1:
+                        outputs = self.model(single_image, single_prompt)
+                        single_label = labels[i:i+1] if isinstance(labels, torch.Tensor) else [labels[i]]
+                        single_label_tensor = torch.tensor([single_label], device=self.device) if not isinstance(labels, torch.Tensor) else single_label
+                        
+                        # ==================== 【新增：收集用于计算 AUC 的数据】 ====================
+                        logits = outputs.get('detection_logits', None)
+                        if logits is not None:
+                            prob = torch.sigmoid(logits).squeeze().item()
+                            all_pred_scores.append(prob)
+                            true_lbl = single_label_tensor.squeeze().item()
+                            all_true_labels.append(true_lbl)
+                        # =========================================================================
+
+                        mask = None
+                        if isinstance(annotation_info, dict):
+                            mask_data = annotation_info.get('mask')
+                            if isinstance(mask_data, (list, tuple)) and i < len(mask_data):
+                                mask = mask_data[i]
+                        loss_dict = self.compute_loss_stage1(outputs, single_label_tensor, mask)
+                        
+                    elif self.stage == 2:
+                        single_info = {k: v[i] if isinstance(v, (list, tuple, torch.Tensor)) else v for k, v in annotation_info.items()}
+                        expert_explanation = single_info.get('expert_explanation', '')
+                        combined_text = single_prompt + " " + expert_explanation if expert_explanation else single_prompt
+                        outputs = self.model(single_image, combined_text)
+                        loss_dict = self.compute_loss_stage2(outputs, single_info, self.tokenizer, single_prompt)
+                    else:
+                        single_info = {k: v[i] if isinstance(v, (list, tuple, torch.Tensor)) else v for k, v in annotation_info.items()}
+                        winner_text = single_info.get('winner', '')
+                        loser_text = single_info.get('loser', '')
+                        loss_dict = self.compute_loss_stage3(single_image, winner_text, loser_text)
+                    
+                    batch_losses.append(loss_dict['total_loss'])
+                
+                loss = torch.mean(torch.stack(batch_losses))
+                total_loss += loss.item()
+        
+        # 返回 loss 的同时，返回收集到的标签和分数
+        return total_loss / len(loader), all_true_labels, all_pred_scores
         self.model.eval()
         total_loss = 0.0
         

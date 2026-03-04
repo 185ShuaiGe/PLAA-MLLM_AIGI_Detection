@@ -76,7 +76,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--num_epochs", 
         type=int, 
-        default=10, 
+        default=3, 
         help="训练轮数"
     )
     parser.add_argument(
@@ -104,24 +104,7 @@ def main() -> None:
     # 1. 实例化基础模型
     model = PLAAMLLM(model_config, device_config, path_config)
 
-    # =========================================================================
-    # 【核心修复】：如果是验证/测试阶段，必须先注入 LoRA 架构，才能接住 checkpoint 里的 LoRA 权重！
-    # =========================================================================
-    if args.mode in ['val', 'test']: 
-        logger.info("Applying LoRA architecture for validation/testing...")
-        if hasattr(model, 'llm_infer') and hasattr(model.llm_infer, 'llm_model'):
-            lora_config = LoraConfig(
-                r=model_config.lora_rank,
-                lora_alpha=model_config.lora_alpha,
-                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-                lora_dropout=0.05,
-                bias="none",
-                task_type="CAUSAL_LM"
-            )
-            # 给验证模型也包上 LoRA
-            model.llm_infer.llm_model = get_peft_model(model.llm_infer.llm_model, lora_config)
-            logger.info("LoRA architecture applied successfully.")
-    # =========================================================================
+
     # 单卡训练
     # device = device_config.get_device()
     # model = model.to(device)
@@ -139,26 +122,39 @@ def main() -> None:
 
     if args.checkpoint and os.path.exists(args.checkpoint):
         logger.info(f"Loading checkpoint from {args.checkpoint}")
+        
+        # 先读取 checkpoint 以判断是否包含 LoRA 阶段的权重
+        ckpt = torch.load(args.checkpoint, map_location='cpu')
+        state_dict = ckpt.get('model_state_dict', ckpt)
+        lora_weights = {k: v for k, v in state_dict.items() if 'lora' in k}
+        
+        # ==================== 【修复核心】按需注入 LoRA ====================
+        if len(lora_weights) > 0 and args.mode in ['val', 'inference']:
+            logger.info("Detected LoRA weights in checkpoint. Applying LoRA architecture...")
+            lora_config = LoraConfig(
+                r=model_config.lora_rank,
+                lora_alpha=model_config.lora_alpha,
+                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+                lora_dropout=0.05,
+                bias="none",
+                task_type="CAUSAL_LM"
+            )
+            model.llm_infer.llm_model = get_peft_model(model.llm_infer.llm_model, lora_config)
+        # =================================================================
+
         model.load_checkpoint(args.checkpoint)
+
         # ==================== 终极诊断与强制加载代码 ====================
         print("\n" + "="*60)
         print("🔍 开始强制诊断与提取 LoRA 权重...")
         
-        # 1. 重新独立读取一次权重文件，防止被 plaa_mllm 的内部机制过滤
-        ckpt = torch.load(args.checkpoint, map_location='cpu')
-        state_dict = ckpt.get('model_state_dict', ckpt)
-        
-        # 2. 暴力提取所有名字里带 'lora' 的参数
-        lora_weights = {k: v for k, v in state_dict.items() if 'lora' in k}
-        print(f"1. 在文件 {args.checkpoint} 中，共发现 {len(lora_weights)} 个 LoRA 参数。")
-        
         if len(lora_weights) > 0:
-            # 3. 强行将这部分参数灌入当前模型
+            #强行将这部分参数灌入当前模型
             res = model.load_state_dict(lora_weights, strict=False)
             missing_lora = [k for k in res.missing_keys if 'lora' in k]
             print(f"2. 强制挂载执行完毕。未能成功对齐的 LoRA 参数数量: {len(missing_lora)}")
             
-            # 4. 核心验伤：检查 LoRA B 矩阵
+            # 核心验伤：检查 LoRA B 矩阵
             # 原理：LoRA 训练前，B矩阵默认全为0。如果这里求和为0，说明你第二阶段训练根本没更新参数！
             lora_b_sum = sum(p.abs().sum().item() for n, p in model.named_parameters() if 'lora_B' in n)
             print(f"3. 当前模型中 LoRA_B 的权重绝对值之和为: {lora_b_sum}")

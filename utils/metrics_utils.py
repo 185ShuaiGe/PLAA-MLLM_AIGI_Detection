@@ -317,3 +317,45 @@ class MetricsCalculator:
         plt.tight_layout()
         plt.savefig(os.path.join(self.metrics_dir, 'metrics_bar_chart.png'))
         plt.close()
+
+    def plot_training_history(self, history: Dict[str, List[float]]) -> None:
+        """
+        绘制训练损失和验证指标随 Epoch 变化的曲线
+        
+        Args:
+            history: 包含 'train_loss', 'val_loss', 'val_auc' 等列表的字典
+        """
+        if not history or not history.get('train_loss'):
+            return
+            
+        epochs = range(1, len(history['train_loss']) + 1)
+        plt.figure(figsize=(12, 5))
+        
+        # 绘制 Loss 曲线
+        plt.subplot(1, 2, 1)
+        plt.plot(epochs, history['train_loss'], label='Train Loss', marker='o')
+        if 'val_loss' in history and history['val_loss']:
+            plt.plot(epochs, history['val_loss'], label='Validation Loss', marker='s')
+        plt.title('Loss over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.xticks(epochs)
+        plt.grid(True, linestyle='--', alpha=0.6)
+        plt.legend()
+        
+        # 绘制 AUC 曲线
+        plt.subplot(1, 2, 2)
+        if 'val_auc' in history and history['val_auc']:
+            plt.plot(epochs, history['val_auc'], label='Validation AUC', marker='^', color='green')
+            plt.title('Validation AUC over Epochs')
+            plt.xlabel('Epoch')
+            plt.ylabel('AUC Score')
+            plt.xticks(epochs)
+            plt.grid(True, linestyle='--', alpha=0.6)
+            plt.legend()
+            
+        plt.tight_layout()
+        save_path = os.path.join(self.metrics_dir, 'training_history_curve.png')
+        plt.savefig(save_path)
+        plt.close()
+        self.logger.info(f"Training history curve saved to {save_path}")

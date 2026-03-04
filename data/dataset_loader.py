@@ -37,7 +37,7 @@ class AIGIDataset(Dataset):
         self.logger = Logger(name=f"AIGIDataset_{split}_stage{stage}")
         
         self.data_dir = os.path.join(path_config.data_dir, split)
-        self.annotation_file = os.path.join(self.data_dir, "annotations.json")
+        self.annotation_file = os.path.join(self.data_dir, "annotations_unified.json")
         
         self.samples = self._load_annotations()
         self.transform = self._build_transform()

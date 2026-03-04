@@ -29,7 +29,7 @@ class LLMInference(nn.Module):
                 # torch_dtype=torch.float16,
                 quantization_config=quantization_config, # 使用量化配置
                 device_map="auto",        
-                max_memory={0: "0GiB", 1: "23GiB"} #限制 GPU 0 的最大显存使用量，强制剩余部分溢出到 GPU 1 
+                max_memory={0: "15GiB", 1: "5GiB"} #限制 GPU 0 的最大显存使用量，强制剩余部分溢出到 GPU 1 
             )
         except Exception as e:
             print(f"Error loading LLM: {e}")

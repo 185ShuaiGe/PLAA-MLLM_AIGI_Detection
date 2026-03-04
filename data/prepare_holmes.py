@@ -83,8 +83,8 @@ def main():
     val_samples = samples[split_idx:]
 
     # 5. 写入 JSON 文件
-    train_annotation_path = os.path.join(train_dir, "annotations.json")
-    val_annotation_path = os.path.join(val_dir, "annotations.json")
+    train_annotation_path = os.path.join(train_dir, "annotations_unified.json")
+    val_annotation_path = os.path.join(val_dir, "annotations_unified.json")
     
     print(f"正在保存训练集 ({len(train_samples)} 个样本) 到 {train_annotation_path} ...")
     with open(train_annotation_path, 'w', encoding='utf-8') as f:
