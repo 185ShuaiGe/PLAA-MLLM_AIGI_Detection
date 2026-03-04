@@ -82,7 +82,7 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--lr", 
         type=float, 
-        default=1e-4, 
+        default=1e-5, 
         help="学习率"
     )
     

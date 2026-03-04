@@ -37,9 +37,9 @@ class PLAAMLLM(nn.Module):
 
     def forward(self, image, text_prompt, text_guidance=None):
         # 自动判断视觉编码器是否被冻结，若冻结则不记录梯度图，省下海量中间激活值的显存
-        visual_requires_grad = any(p.requires_grad for p in self.dual_stream_encoder.parameters())
-        with torch.set_grad_enabled(visual_requires_grad):
-            semantic_features, artifact_features = self.dual_stream_encoder(image)
+        # visual_requires_grad = any(p.requires_grad for p in self.dual_stream_encoder.parameters())
+        # with torch.set_grad_enabled(visual_requires_grad):
+        semantic_features, artifact_features = self.dual_stream_encoder(image)
         
         text_guidance_tensor = None
         if text_guidance is not None and self.llm_infer.tokenizer is not None:
@@ -65,6 +65,7 @@ class PLAAMLLM(nn.Module):
         pooled_vision = projected_vision_tokens.mean(dim=1)
         detection_logits = self.detection_head(pooled_vision)
         
+        # （plaa_mllm.py forward 函数的后半部分）
         pred_mask = None
         try:
             mask_flat = self.mask_head(pooled_vision)
@@ -73,23 +74,34 @@ class PLAAMLLM(nn.Module):
             pass
         
         llm_outputs = {}
-        try:
-            if self.llm_infer.tokenizer is not None:
-                tokenized = self.llm_infer.tokenizer(
-                    text_prompt,
-                    return_tensors='pt',
-                    truncation=True,
-                    max_length=self.model_config.max_seq_len
-                ).to(image.device)
-                
-                llm_out = self.llm_infer.forward(
-                    input_ids=tokenized['input_ids'],
-                    attention_mask=tokenized['attention_mask'],
-                    vision_tokens=projected_vision_tokens
-                )
-                llm_outputs.update(llm_out)
-        except Exception as e:
-            print(f"Error in LLM forward pass: {e}")
+        # ==================== 【核心修复 2】 ====================
+        # Stage 1 时 LLM 没被解冻，强行执行不仅没用，还会严重拖慢整批训练的速度！
+        llm_is_frozen = not any(p.requires_grad for p in self.llm_infer.parameters())
+        if self.training and llm_is_frozen:
+            skip_llm = True
+        else:
+            skip_llm = False
+            
+        if not skip_llm:
+            try:
+                if self.llm_infer.tokenizer is not None:
+                    tokenized = self.llm_infer.tokenizer(
+                        text_prompt,
+                        return_tensors='pt',
+                        padding=True,          # 必须加 padding=True 才能支持输入 text list！
+                        truncation=True,
+                        max_length=self.model_config.max_seq_len
+                    ).to(image.device)
+                    
+                    llm_out = self.llm_infer.forward(
+                        input_ids=tokenized['input_ids'],
+                        attention_mask=tokenized['attention_mask'],
+                        vision_tokens=projected_vision_tokens
+                    )
+                    llm_outputs.update(llm_out)
+            except Exception as e:
+                print(f"Error in LLM forward pass: {e}")
+        # =========================================================
         
         return {
             'vision_tokens': projected_vision_tokens,
