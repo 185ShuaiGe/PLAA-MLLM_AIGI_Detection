@@ -40,6 +40,9 @@ class LLMInference(nn.Module):
         
         self.device = device_config.get_device()
         self._init_tokenizer()
+
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
     
     def _init_tokenizer(self) -> None:
         """

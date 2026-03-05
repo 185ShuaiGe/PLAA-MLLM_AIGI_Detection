@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch.backends.cudnn as cudnn 
 
 # 👇【新增这行】：强制禁用 cuDNN，绕过 RTX40 系列显卡在混合精度下的 NaN Bug
-cudnn.enabled = False
+cudnn.enabled = True
 
 from typing import Dict, List, Optional, Tuple, Any
 from torch.utils.data import DataLoader
@@ -63,7 +63,7 @@ class PLAAMLLMTrainer:
         self.epoch = 0
 
         # 初始化 GradScaler
-        self.scaler = torch.cuda.amp.GradScaler(enabled=True)
+        # self.scaler = torch.cuda.amp.GradScaler(enabled=True)
         
         self._setup_stage()
     
@@ -430,6 +430,8 @@ class PLAAMLLMTrainer:
                     # 直接输入整个 Batch，废弃 for 循环，让 BatchNorm 正常工作！
                     # 同时传入 text_guidance 给交叉注意力机制
                     outputs = self.model(images, text_prompts, text_guidance=text_prompts)
+                    logits = outputs.get('detection_logits')
+                    # print(f"Logits Mean: {logits.mean().item():.4f}, Std: {logits.std().item():.4f}")
                     
                     masks = annotation_info.get('mask') if isinstance(annotation_info, dict) else None
                     if masks is not None and isinstance(masks, torch.Tensor):
@@ -446,9 +448,23 @@ class PLAAMLLMTrainer:
             
             loss = loss_dict['total_loss']
 
+            #标准的FP32训练步骤：
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             optimizer.step()
+
+            #混合精度训练步骤：
+            # 使用 scaler 放大 loss 并反向传播
+            # self.scaler.scale(loss).backward()
+
+            # # 梯度裁剪前需要先 unscale，否则裁剪的数值范围是错的
+            # self.scaler.unscale_(optimizer)
+            # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+            # # 使用 scaler 执行优化器并更新 scale
+            # self.scaler.step(optimizer)
+            # self.scaler.update()
+
             optimizer.zero_grad()
             
             total_loss += loss.item()

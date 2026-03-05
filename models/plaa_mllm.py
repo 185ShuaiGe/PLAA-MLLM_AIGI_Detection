@@ -52,7 +52,7 @@ class PLAAMLLM(nn.Module):
                 ).to(image.device)
                 text_guidance_tensor = self.llm_infer.llm_model.get_input_embeddings()(tokenized['input_ids'])
             except:
-                pass
+                raise ValueError("Failed to tokenize text guidance. Please check the input and tokenizer configuration.")
         
         vision_tokens = self.forensic_cross_attention(
             semantic_features,
