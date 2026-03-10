@@ -126,22 +126,14 @@ class LLMInference(nn.Module):
         vision_tokens: Optional[torch.Tensor] = None,
         max_new_tokens: int = 256
     ) -> str:
-        """
-        生成自然语言检测结果和解释
-
-        Args:
-            prompt: 输入文本提示
-            vision_tokens: 可选的视觉令牌，形状 [B, N, D]
-            max_new_tokens: 最大生成长度
-
-        Returns:
-            str: 生成的自然语言检测结果
-        """
         if self.tokenizer is None or self.llm_model is None:
-            return self._fallback_explanation(0.5)
+            return None # 改为返回 None，把后备处理交给外层
         
         try:
-            inputs = self.tokenizer(prompt, return_tensors='pt').to(self.device)
+            # 获取 LLM 当前所在的设备
+            llm_device = self.llm_model.device
+            
+            inputs = self.tokenizer(prompt, return_tensors='pt').to(llm_device)
             input_ids = inputs['input_ids']
             attention_mask = inputs['attention_mask']
             
@@ -149,20 +141,25 @@ class LLMInference(nn.Module):
             if vision_tokens is not None:
                 if hasattr(self.llm_model, 'get_input_embeddings'):
                     text_embeds = self.llm_model.get_input_embeddings()(input_ids)
+                    
+                    # 【核心修复 1】: 将 vision_tokens 转移到 text_embeds 的设备和类型上
+                    vision_tokens = vision_tokens.to(device=text_embeds.device, dtype=text_embeds.dtype)
                     inputs_embeds = torch.cat([vision_tokens, text_embeds], dim=1)
                     
+                    # 【核心修复 2】: 确保 vision_mask 也在相同的设备上
                     vision_mask = torch.ones((vision_tokens.size(0), vision_tokens.size(1)), 
-                                            dtype=torch.long, device=self.device)
-                    fused_attention_mask = torch.cat([vision_mask, attention_mask], dim=1)
+                                            dtype=attention_mask.dtype, device=text_embeds.device)
+                    fused_attention_mask = torch.cat([vision_mask, attention_mask.to(text_embeds.device)], dim=1)
                     attention_mask = fused_attention_mask
             
+            # 在 generate 函数中修改生成参数
             generate_kwargs = {
-                'max_new_tokens': max_new_tokens,
-                'temperature': getattr(self.config, 'temperature', 0.7),
-                'top_p': getattr(self.config, 'top_p', 0.9),
-                'do_sample': True,
+                'max_new_tokens': 128,         # 从256降低到128，防止解释完毕后强行凑字数
+                'do_sample': False,            # 开启贪心解码，必须设为 False（关闭随机采样）
+                'repetition_penalty': 1.1,     # 从1.2降为1.1，惩罚过高会导致模型造出不存在的生僻词
                 'pad_token_id': self.tokenizer.eos_token_id
             }
+            # 注意：如果 do_sample=False，就不要再传 temperature 和 top_p 参数了，否则会报错。
             
             if inputs_embeds is not None:
                 generate_kwargs['inputs_embeds'] = inputs_embeds
@@ -178,25 +175,17 @@ class LLMInference(nn.Module):
             return self._postprocess_explanation(generated_text)
             
         except Exception as e:
-            return self._fallback_explanation(0.5)
-    
+            # 打印错误，这样以后出现问题就不会再“悄悄失败”了
+            print(f"\n Generation Error: {e}\n")
+            return None   
+
     def generate_explanation(
         self,
         image_features: torch.Tensor,
         detection_score: float,
         prompt: Optional[str] = None
     ) -> str:
-        """
-        基于视觉令牌生成自然语言解释
-
-        Args:
-            image_features: 图像视觉特征/令牌
-            detection_score: 检测置信度分数 (0-1)
-            prompt: 可选的文本提示
-
-        Returns:
-            str: 生成的自然语言解释文本
-        """
+        
         if self.tokenizer is None or self.llm_model is None:
             return self._fallback_explanation(detection_score)
         
@@ -207,8 +196,13 @@ class LLMInference(nn.Module):
                 prompt = "Analyze this image and explain why it seems to be real."
         
         explanation = self.generate(prompt, image_features)
+        
+        # 【核心修复 3】: 如果生成失败（返回了 None），我们用正确的 detection_score 进行兜底
+        if explanation is None:
+            return self._fallback_explanation(detection_score)
+            
         return explanation
-    
+
     def _fallback_explanation(self, detection_score: float) -> str:
         """
         当 LLM 不可用时的回退解释

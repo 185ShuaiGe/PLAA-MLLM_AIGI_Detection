@@ -118,8 +118,8 @@ class PLAAMLLMValidator:
         # =========================================================================
 
         # 如果需要保存详细的推理结果 json 文件，您可以取消下面这两行的注释
-        if save_results:
-            self._save_results(output_dir)
+        # if save_results:
+        #     self._save_results(output_dir)
         
         return aggregated_results
     

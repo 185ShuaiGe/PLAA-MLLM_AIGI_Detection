@@ -219,9 +219,9 @@ class PLAAMLLMTrainer:
                 if single_prompt is not None:
                     if isinstance(expert_text, (list, tuple)):
                         expert_text = expert_text[0]
-                    full_text = single_prompt + " " + expert_text
+                    full_text = single_prompt + " " + expert_text + tokenizer.eos_token
                 else:
-                    full_text = expert_text
+                    full_text = expert_text + tokenizer.eos_token
                 
                 tokenized_full = tokenizer(
                     full_text,
@@ -440,7 +440,7 @@ class PLAAMLLMTrainer:
                     expert_text = annotation_info.get('expert_explanation', '')
                     if isinstance(expert_text, (list, tuple)):
                         expert_text = expert_text[0]
-                    full_text = single_prompt + " " + expert_text
+                    full_text = single_prompt + " " + expert_text + self.tokenizer.eos_token
                     
                     outputs = self.model(images, [full_text]) 
                     loss_dict = self.compute_loss_stage2(
@@ -520,7 +520,7 @@ class PLAAMLLMTrainer:
                             expert_text = expert_text[0]
                             
                         # 3. 拼接完整的 Prompt + Answer
-                        full_text = single_prompt + " " + expert_text
+                        full_text = single_prompt + " " + expert_text + self.tokenizer.eos_token
                         
                         # 4. 【核心修复】将 full_text 传入模型！
                         # 必须传入完整文本，这样模型输出的 logits 长度才会和后面的 labels 长度(如 507)完全对齐

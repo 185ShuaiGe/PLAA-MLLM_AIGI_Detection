@@ -50,7 +50,7 @@ class PLAAMLLM(nn.Module):
                     padding=True,
                     truncation=True
                 ).to(image.device)
-                text_guidance_tensor = self.llm_infer.llm_model.get_input_embeddings()(tokenized['input_ids'])
+                text_guidance_tensor = self.llm_infer.llm_model.get_input_embeddings()(tokenized['input_ids']).to(image.device)
             except:
                 raise ValueError("Failed to tokenize text guidance. Please check the input and tokenizer configuration.")
         
@@ -113,31 +113,29 @@ class PLAAMLLM(nn.Module):
     def detect_image(self, image, text_guidance=None):
         self.eval()
         with torch.no_grad():
-            outputs = self.forward(image, "Classify this image as real or AI-generated.", text_guidance)
-            
-            projected_vision_tokens = outputs.get('vision_tokens')
-            detection_logits = outputs.get('detection_logits')
-            confidence = torch.sigmoid(detection_logits).item() if detection_logits is not None else 0.5
-            
-            # 动态构建引导 LLM 的 Prompt
-            is_fake = confidence > 0.5
-            label_str = "AI-generated" if is_fake else "Real"
-            
-            if text_guidance is None:
-                # 显式告知 LLM 分类结果，要求其提供相应的视觉特征解释
-                prompt = f"The detection system has classified this image as {label_str} with a confidence score of {confidence:.4f}. Please explain the visual artifacts or reasons that support this classification."
-            else:
-                prompt = text_guidance
+            # ======== 【核心修复 1】：加入与训练时完全相同的 bfloat16 混合精度 ========
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                outputs = self.forward(image, "<image>\nAnalyze this image and determine if it is real or AI-generated. Please provide your reasoning.", text_guidance)
                 
-            try:
-                explanation = self.llm_infer.generate_explanation(
-                    image_features=projected_vision_tokens, 
-                    detection_score=confidence, 
-                    prompt=prompt
-                )
-            except Exception as e:
-                print(f"Explanation Generation Error: {e}")
-                explanation = "AI-generated" if confidence > 0.5 else "Real"
+                projected_vision_tokens = outputs.get('vision_tokens')
+                detection_logits = outputs.get('detection_logits')
+                confidence = torch.sigmoid(detection_logits).item() if detection_logits is not None else 0.5
+                
+                if text_guidance is None:
+                    prompt = "<image>\nAnalyze this image and determine if it is real or AI-generated. Please provide your reasoning."
+                else:
+                    prompt = text_guidance
+                    
+                try:
+                    explanation = self.llm_infer.generate_explanation(
+                        image_features=projected_vision_tokens, 
+                        detection_score=confidence, 
+                        prompt=prompt
+                    )
+                except Exception as e:
+                    print(f"Explanation Generation Error: {e}")
+                    explanation = "AI-generated" if confidence > 0.5 else "Real"
+            # =====================================================================
         
         return confidence, explanation
 
