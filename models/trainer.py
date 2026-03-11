@@ -118,33 +118,48 @@ class PLAAMLLMTrainer:
         self.logger.info(f"Trainable parameters after freezing: {trainable_count:,}")
     
     def _unfreeze_artifact_adapter(self):
-        self.logger.info("Unfreezing artifact stream and cross-attention adapter")
+        self.logger.info("Unfreezing artifact stream and MoME fusion network")
         
         if hasattr(self.model, 'dual_stream_encoder'):
             if hasattr(self.model.dual_stream_encoder, 'artifact_stream'):
                 for param in self.model.dual_stream_encoder.artifact_stream.parameters():
                     param.requires_grad = True
         
-        if hasattr(self.model, 'forensic_cross_attention'):
-            for param in self.model.forensic_cross_attention.parameters():
+        if hasattr(self.model, 'mome_fusion'):
+            for param in self.model.mome_fusion.parameters():
                 param.requires_grad = True
         
-        # ==================== 【修复核心 1】显式解冻投影层和分类头 ====================
-        for head in ['vision_token_proj', 'detection_head', 'mask_head']:
-            if hasattr(self.model, head):
-                for param in getattr(self.model, head).parameters():
-                    param.requires_grad = True
-        # =========================================================================
+        # 解冻视觉 token 投影层
+        if hasattr(self.model, 'vision_token_proj'):
+            for param in self.model.vision_token_proj.parameters():
+                param.requires_grad = True
         
         trainable_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         self.logger.info(f"Trainable parameters after unfreezing: {trainable_count:,}")
     
     def _freeze_visual_streams(self):
-        self.logger.info("Freezing all visual streams")
+        self.logger.info("Freezing CLIP semantic stream, keeping artifact stream and MoME fusion trainable")
         
         if hasattr(self.model, 'dual_stream_encoder'):
-            for param in self.model.dual_stream_encoder.parameters():
-                param.requires_grad = False
+            # 只冻结语义流（CLIP）
+            if hasattr(self.model.dual_stream_encoder, 'semantic_stream'):
+                for param in self.model.dual_stream_encoder.semantic_stream.parameters():
+                    param.requires_grad = False
+            
+            # 保持伪影流可训练
+            if hasattr(self.model.dual_stream_encoder, 'artifact_stream'):
+                for param in self.model.dual_stream_encoder.artifact_stream.parameters():
+                    param.requires_grad = True
+        
+        # 保持 MoME 融合网络可训练
+        if hasattr(self.model, 'mome_fusion'):
+            for param in self.model.mome_fusion.parameters():
+                param.requires_grad = True
+        
+        # 保持视觉 token 投影层可训练
+        if hasattr(self.model, 'vision_token_proj'):
+            for param in self.model.vision_token_proj.parameters():
+                param.requires_grad = True
         
         trainable_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         self.logger.info(f"Trainable parameters after freezing visual streams: {trainable_count:,}")
@@ -175,9 +190,10 @@ class PLAAMLLMTrainer:
                 except Exception as e:
                     self.logger.warning(f"Failed to apply LoRA: {e}")
     
-    def compute_loss_stage1(self, outputs, labels, masks=None):
+    def compute_loss_stage1(self, outputs, labels, masks=None, tokenizer=None, text_prompt=None, annotation_info=None):
         loss_dict = {}
         
+        # 计算检测损失
         detection_logits = outputs.get('detection_logits', None)
         if detection_logits is not None:
             labels = labels.to(self.device).float().view(-1)                
@@ -185,11 +201,79 @@ class PLAAMLLMTrainer:
             bce_loss = F.binary_cross_entropy_with_logits(detection_logits, labels)
             loss_dict['bce_loss'] = bce_loss
         
+        # 计算掩码损失
         if masks is not None:
             pred_mask = outputs.get('pred_mask', None)
             if pred_mask is not None:
                 dice_loss = self._dice_loss(pred_mask, masks.to(self.device))
                 loss_dict['dice_loss'] = dice_loss
+        
+        # 计算文本对齐损失（CLM Loss）
+        logits = outputs.get('logits', None)
+        if logits is not None and tokenizer is not None and annotation_info is not None:
+            expert_texts = annotation_info.get('expert_explanation', '')
+            if expert_texts:
+                # 处理整个 batch
+                if isinstance(expert_texts, str):
+                    expert_texts = [expert_texts]
+                
+                if isinstance(text_prompt, str):
+                    text_prompt = [text_prompt]
+                
+                # 构建完整文本列表
+                full_texts = []
+                for p, e in zip(text_prompt, expert_texts):
+                    full_text = p + " " + e + tokenizer.eos_token
+                    full_texts.append(full_text)
+                
+                # 批量 tokenize
+                tokenized_full = tokenizer(
+                    full_texts,
+                    max_length=self.model_config.max_seq_len,
+                    truncation=True,
+                    padding=True,
+                    return_tensors='pt'
+                )
+                full_target_ids = tokenized_full['input_ids'].to(self.device)
+                
+                # 计算每个样本的 prompt tokens 数量
+                num_prompt_tokens = []
+                for p in text_prompt:
+                    tokenized_prompt = tokenizer(
+                        p,
+                        return_tensors='pt'
+                    )
+                    num_prompt_tokens.append(tokenized_prompt['input_ids'].size(1))
+                
+                target_ids = full_target_ids.clone()
+                # 对每个样本设置 prompt 部分为 -100
+                for i, n in enumerate(num_prompt_tokens):
+                    if n > 0 and n < target_ids.size(1):
+                        target_ids[i, :n] = -100
+                
+                # 创建视觉 token 掩码
+                vision_tokens = outputs.get('vision_tokens', None)
+                num_vision_tokens = vision_tokens.size(1) if vision_tokens is not None else self.model_config.num_latent_queries
+                batch_size = target_ids.size(0)
+                
+                ignore_vision = torch.full(
+                    (batch_size, num_vision_tokens),
+                    -100,
+                    dtype=target_ids.dtype,
+                    device=self.device
+                )
+                
+                target_mask = torch.cat([ignore_vision, target_ids], dim=1)
+                
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = target_mask[..., 1:].contiguous().to(shift_logits.device)
+                
+                clm_loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100
+                )
+                loss_dict['clm_loss'] = clm_loss
         
         if not loss_dict:
             dummy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
@@ -214,66 +298,142 @@ class PLAAMLLMTrainer:
             vision_tokens = outputs.get('vision_tokens', None)
             num_vision_tokens = vision_tokens.size(1) if vision_tokens is not None else self.model_config.num_latent_queries
             
-            expert_text = labels.get('expert_explanation', '')
-            if tokenizer is not None and expert_text:
-                if single_prompt is not None:
-                    if isinstance(expert_text, (list, tuple)):
-                        expert_text = expert_text[0]
-                    full_text = single_prompt + " " + expert_text + tokenizer.eos_token
-                else:
-                    full_text = expert_text + tokenizer.eos_token
+            expert_texts = labels.get('expert_explanation', '')
+            if tokenizer is not None and expert_texts:
+                # 处理整个 batch
+                if isinstance(expert_texts, str):
+                    expert_texts = [expert_texts]
                 
+                if isinstance(single_prompt, str):
+                    single_prompt = [single_prompt]
+                
+                # 构建完整文本列表
+                full_texts = []
+                for p, e in zip(single_prompt, expert_texts):
+                    full_text = p + " " + e + tokenizer.eos_token
+                    full_texts.append(full_text)
+                
+                # 批量 tokenize
                 tokenized_full = tokenizer(
-                    full_text,
+                    full_texts,
                     max_length=self.model_config.max_seq_len,
                     truncation=True,
+                    padding=True,
                     return_tensors='pt'
                 )
                 full_target_ids = tokenized_full['input_ids'].to(self.device)
                 
-                num_prompt_tokens = 0
-                if single_prompt is not None:
+                # 计算每个样本的 prompt tokens 数量
+                num_prompt_tokens = []
+                for p in single_prompt:
                     tokenized_prompt = tokenizer(
-                        single_prompt,
+                        p,
                         return_tensors='pt'
                     )
-                    num_prompt_tokens = tokenized_prompt['input_ids'].size(1)
+                    num_prompt_tokens.append(tokenized_prompt['input_ids'].size(1))
                 
                 target_ids = full_target_ids.clone()
-                if num_prompt_tokens > 0 and num_prompt_tokens < target_ids.size(1):
-                    target_ids[0, :num_prompt_tokens] = -100
+                # 对每个样本设置 prompt 部分为 -100
+                for i, n in enumerate(num_prompt_tokens):
+                    if n > 0 and n < target_ids.size(1):
+                        target_ids[i, :n] = -100
                 
+                # 创建视觉 token 掩码
+                batch_size = target_ids.size(0)
                 ignore_vision = torch.full(
-                    (target_ids.size(0), num_vision_tokens),
+                    (batch_size, num_vision_tokens),
                     -100,
                     dtype=target_ids.dtype,
                     device=self.device
                 )
-                
-                if ignore_vision.dim() != 2:
-                    ignore_vision = ignore_vision.squeeze(0) if ignore_vision.dim() == 3 else ignore_vision
-                if target_ids.dim() != 2:
-                    target_ids = target_ids.squeeze(0) if target_ids.dim() == 3 else target_ids
-                
-                if ignore_vision.size(0) != target_ids.size(0):
-                    if ignore_vision.size(0) == 1 and target_ids.size(0) > 1:
-                        ignore_vision = ignore_vision.repeat(target_ids.size(0), 1)
-                    elif target_ids.size(0) == 1 and ignore_vision.size(0) > 1:
-                        target_ids = target_ids.repeat(ignore_vision.size(0), 1)
                 
                 target_mask = torch.cat([ignore_vision, target_ids], dim=1)
                 
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = target_mask[..., 1:].contiguous().to(shift_logits.device)
                 
-                clm_loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    ignore_index=-100
+                # 计算加权交叉熵损失
+                loss = self._weighted_cross_entropy_loss(
+                    shift_logits,
+                    shift_labels,
+                    tokenizer,
+                    expert_texts
                 )
-                return {'clm_loss': clm_loss, 'total_loss': clm_loss}
+                return {'clm_loss': loss, 'total_loss': loss}
         
         return {'total_loss': torch.tensor(0.0, device=self.device, requires_grad=True)}
+    
+    def _weighted_cross_entropy_loss(self, logits, labels, tokenizer, expert_texts):
+        """
+        自定义加权交叉熵损失函数
+        对关键结构化锚点处的 Token 预测赋予更高的权重
+        
+        Args:
+            logits: 模型输出的 logits，形状 [B, T, V]
+            labels: 目标标签，形状 [B, T]
+            tokenizer: 分词器
+            expert_texts: 专家解释文本列表
+        
+        Returns:
+            torch.Tensor: 加权损失
+        """
+        # 定义关键结构化锚点
+        key_anchors = [
+            "1. Line segments:",
+            "2. Edges:", 
+            "3. Textures:",
+            "4. Shadows:",
+            "5. Lighting:",
+            "6. Reflections:",
+            "7. Symmetry:",
+            "8. Proportions:",
+            "9. Background:",
+            "10. Artifacts:",
+            "11. Overall consistency:"  
+        ]
+        
+        # 生成权重掩码
+        batch_size, seq_len = labels.shape
+        weights = torch.ones(batch_size, seq_len, device=self.device)
+        
+        # 对每个样本计算权重
+        for i in range(batch_size):
+            # 获取当前样本的文本
+            if isinstance(expert_texts, list) and i < len(expert_texts):
+                sample_text = expert_texts[i]
+            else:
+                sample_text = str(expert_texts)
+            
+            # 检查每个锚点
+            for anchor in key_anchors:
+                if anchor in sample_text:
+                    # 分词锚点，不添加特殊标记
+                    anchor_tokens = tokenizer(anchor, return_tensors='pt', add_special_tokens=False)['input_ids'][0]
+                    anchor_len = len(anchor_tokens)
+                    
+                    # 查找锚点在序列中的位置
+                    for j in range(seq_len - anchor_len + 1):
+                        if (labels[i, j:j+anchor_len] == anchor_tokens.to(self.device)).all():
+                            # 对锚点及其后的解释文本赋予更高权重
+                            weights[i, j:j+anchor_len+50] = 2.0  # 50 是解释文本的大致长度
+                            break
+        
+        # 忽略填充位置
+        weights[labels == -100] = 0.0
+        
+        # 计算加权损失
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+            ignore_index=-100,
+            reduction='none'
+        )
+        
+        # 应用权重
+        weighted_loss = loss * weights.view(-1)
+        weighted_loss = weighted_loss.sum() / (weights.view(-1).sum() + 1e-8)
+        
+        return weighted_loss
     
     def compute_loss_stage3(self, image, winner_text, loser_text, beta=0.1):
         try:
@@ -415,56 +575,73 @@ class PLAAMLLMTrainer:
         self.model.train()
         total_loss = 0.0
         
-        # 【新增】设置梯度累加步数。相当于将真实的 Batch Size 放大 8 倍
-        # 这将消除 batch_size=1 带来的极端梯度噪音
+        # 设置梯度累加步数
         accum_steps = getattr(self.model_config, 'grad_accum_steps', 8) 
         
         progress_bar = tqdm(loader, desc=f"Training Stage {self.stage}")
-        optimizer.zero_grad() # 【修改】将清空梯度移到循环外
+        optimizer.zero_grad()
         
         for i, batch in enumerate(progress_bar):
             images, labels, annotation_info, text_prompts = batch
             images = images.to(self.device)
             labels_tensor = labels.to(self.device).float() if isinstance(labels, torch.Tensor) else torch.tensor(labels, device=self.device).float()
             
+            # 统一处理 prompts 和 expert_texts，构建 full_texts
+            if isinstance(text_prompts, (list, tuple)):
+                prompts = text_prompts
+            else:
+                prompts = [text_prompts] * images.size(0)
+            
+            expert_texts = annotation_info.get('expert_explanation', '')
+            if isinstance(expert_texts, str):
+                expert_texts = [expert_texts] * images.size(0)
+            
+            # 构建完整文本列表
+            full_texts = []
+            for p, e in zip(prompts, expert_texts):
+                full_text = p + " " + e + self.tokenizer.eos_token
+                full_texts.append(full_text)
+            
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                # 无论哪个阶段，都使用 full_texts 进行前向传播
+                outputs = self.model(images, full_texts)
+                
                 if self.stage == 1:
-                    outputs = self.model(images, text_prompts, text_guidance=text_prompts)
                     masks = annotation_info.get('mask') if isinstance(annotation_info, dict) else None
                     if masks is not None and isinstance(masks, torch.Tensor):
                         masks = masks.to(self.device)
-                    loss_dict = self.compute_loss_stage1(outputs, labels_tensor, masks)
+                    loss_dict = self.compute_loss_stage1(
+                        outputs, 
+                        labels_tensor, 
+                        masks, 
+                        tokenizer=self.tokenizer, 
+                        text_prompt=prompts, 
+                        annotation_info=annotation_info
+                    )
                     
                 elif self.stage == 2:
-                    single_prompt = text_prompts[0] if isinstance(text_prompts, (list, tuple)) else text_prompts
-                    expert_text = annotation_info.get('expert_explanation', '')
-                    if isinstance(expert_text, (list, tuple)):
-                        expert_text = expert_text[0]
-                    full_text = single_prompt + " " + expert_text + self.tokenizer.eos_token
-                    
-                    outputs = self.model(images, [full_text]) 
                     loss_dict = self.compute_loss_stage2(
                         outputs=outputs, 
                         labels=annotation_info, 
                         tokenizer=self.tokenizer,
-                        single_prompt=single_prompt
+                        single_prompt=prompts
                     )
                 else:
                     loss_dict = {'total_loss': torch.tensor(0.0, device=self.device, requires_grad=True)}
             
             loss = loss_dict['total_loss']
 
-            # 【新增】将 loss 根据累加步数进行缩放
+            # 将 loss 根据累加步数进行缩放
             loss = loss / accum_steps
             loss.backward()
 
-            # 【新增】当达到累加步数，或者到了最后一个 batch 时，更新参数
+            # 当达到累加步数，或者到了最后一个 batch 时，更新参数
             if (i + 1) % accum_steps == 0 or (i + 1) == len(loader):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
             
-            # 【修改】记录还原后的真实 loss
+            # 记录还原后的真实 loss
             actual_loss = loss.item() * accum_steps
             total_loss += actual_loss
             self.global_step += 1
@@ -485,13 +662,28 @@ class PLAAMLLMTrainer:
                 images = images.to(self.device)
                 labels_tensor = labels.to(self.device).float() if isinstance(labels, torch.Tensor) else torch.tensor(labels, device=self.device).float()
                 
-                # ==================== 【修复：添加 autocast 混合精度上下文】 ====================
-                # 使用与训练相同的精度（如果报错仍有Half相关，可将bfloat16改为float16）
+                # 统一处理 prompts 和 expert_texts，构建 full_texts
+                if isinstance(text_prompts, (list, tuple)):
+                    prompts = text_prompts
+                else:
+                    prompts = [text_prompts] * images.size(0)
+                
+                expert_texts = annotation_info.get('expert_explanation', '')
+                if isinstance(expert_texts, str):
+                    expert_texts = [expert_texts] * images.size(0)
+                
+                # 构建完整文本列表
+                full_texts = []
+                for p, e in zip(prompts, expert_texts):
+                    full_text = p + " " + e + self.tokenizer.eos_token
+                    full_texts.append(full_text)
+                
+                # 使用与训练相同的精度
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16): 
+                    # 无论哪个阶段，都使用 full_texts 进行前向传播
+                    outputs = self.model(images, full_texts)
+                    
                     if self.stage == 1:
-                        # 整批推理
-                        outputs = self.model(images, text_prompts, text_guidance=text_prompts)
-                        
                         logits = outputs.get('detection_logits', None)
                         if logits is not None:
                             # 收集用于计算 AUC 的数据，注意要转回 float32 再存入 list
@@ -507,39 +699,27 @@ class PLAAMLLMTrainer:
                         if masks is not None and isinstance(masks, torch.Tensor):
                             masks = masks.to(self.device)
                             
-                        loss_dict = self.compute_loss_stage1(outputs, labels_tensor, masks)
+                        loss_dict = self.compute_loss_stage1(
+                            outputs, 
+                            labels_tensor, 
+                            masks, 
+                            tokenizer=self.tokenizer, 
+                            text_prompt=prompts, 
+                            annotation_info=annotation_info
+                        )
                         loss = loss_dict['total_loss']
                         total_loss += loss.item()
                     elif self.stage == 2:
-                        # 1. 提取单条 prompt
-                        single_prompt = text_prompts[0] if isinstance(text_prompts, (list, tuple)) else text_prompts
-                        
-                        # 2. 提取专家解释文本 (请确保 'explanation' 是你 annotation_info 里存答案的 key)
-                        expert_text = annotation_info.get('expert_explanation', '') # 如果你的 key 叫 'text' 或其他，请修改这里
-                        if isinstance(expert_text, (list, tuple)):
-                            expert_text = expert_text[0]
-                            
-                        # 3. 拼接完整的 Prompt + Answer
-                        full_text = single_prompt + " " + expert_text + self.tokenizer.eos_token
-                        
-                        # 4. 【核心修复】将 full_text 传入模型！
-                        # 必须传入完整文本，这样模型输出的 logits 长度才会和后面的 labels 长度(如 507)完全对齐
-                        # 保持和原先 text_prompts 一致的数据类型（放到 list 中）
-                        outputs = self.model(images, [full_text]) 
-                        
-                        # 5. 计算损失
                         loss_dict = self.compute_loss_stage2(
                             outputs=outputs, 
                             labels=annotation_info, 
                             tokenizer=self.tokenizer,
-                            single_prompt=single_prompt
+                            single_prompt=prompts
                         )
                         loss = loss_dict['total_loss']
                         total_loss += loss.item()
-                        # =========================================================
                     else:
                         print("Stage 3 validation not implemented yet.")
-                # =======================================================================
                     
         return total_loss / len(loader), all_true_labels, all_pred_scores 
     

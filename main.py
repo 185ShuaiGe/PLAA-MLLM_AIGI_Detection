@@ -135,7 +135,7 @@ def main() -> None:
     
     # 手动将非大语言模型的模块移动到主设备 cuda:0
     model.dual_stream_encoder = model.dual_stream_encoder.to(device)
-    model.forensic_cross_attention = model.forensic_cross_attention.to(device)
+    model.mome_fusion = model.mome_fusion.to(device)
     model.vision_token_proj = model.vision_token_proj.to(device)
     model.detection_head = model.detection_head.to(device)
     model.mask_head = model.mask_head.to(device)

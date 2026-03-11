@@ -42,47 +42,73 @@ class SemanticStream(nn.Module):
         return features
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
+
+
+
+class SRMFilter(nn.Module):
+    """
+    空间丰富模型（SRM）高通滤波器组
+    用于提取图像中的噪声残差
+    """
+    def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.GroupNorm(32, out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.GroupNorm(32, out_channels)
+        # 定义 SRM 滤波器
+        filter1 = torch.tensor([
+            [0, 0, 0, 0, 0],
+            [0, -1, 2, -1, 0],
+            [0, 2, -4, 2, 0],
+            [0, -1, 2, -1, 0],
+            [0, 0, 0, 0, 0]
+        ], dtype=torch.float32)
         
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.GroupNorm(32, out_channels)
-            )
+        filter2 = torch.tensor([
+            [-1, 2, -2, 2, -1],
+            [2, -6, 8, -6, 2],
+            [-2, 8, -12, 8, -2],
+            [2, -6, 8, -6, 2],
+            [-1, 2, -2, 2, -1]
+        ], dtype=torch.float32)
+        
+        filter3 = torch.tensor([
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0],
+            [0, 1, -2, 1, 0],
+            [0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0]
+        ], dtype=torch.float32)
+        
+        # 归一化滤波器
+        filter1 /= 4.0
+        filter2 /= 12.0
+        filter3 /= 2.0
+        
+        # 扩展为 3 通道
+        filter1 = filter1.unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
+        filter2 = filter2.unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
+        filter3 = filter3.unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
+        
+        # 创建卷积层，使用固定权重
+        self.filter1 = nn.Conv2d(3, 1, kernel_size=5, padding=2, bias=False)
+        self.filter2 = nn.Conv2d(3, 1, kernel_size=5, padding=2, bias=False)
+        self.filter3 = nn.Conv2d(3, 1, kernel_size=5, padding=2, bias=False)
+        
+        # 设置权重并冻结
+        self.filter1.weight.data = filter1
+        self.filter2.weight.data = filter2
+        self.filter3.weight.data = filter3
+        
+        for param in self.parameters():
+            param.requires_grad = False
     
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
+        # 应用 SRM 滤波器
+        out1 = self.filter1(x)
+        out2 = self.filter2(x)
+        out3 = self.filter3(x)
+        
+        # 拼接三个滤波器的输出
+        out = torch.cat([out1, out2, out3], dim=1)
         return out
-
-
-class FPN(nn.Module):
-    def __init__(self, in_channels_list, out_channels):
-        super().__init__()
-        self.lateral_convs = nn.ModuleList()
-        self.fpn_convs = nn.ModuleList()
-        
-        for in_channels in in_channels_list:
-            self.lateral_convs.append(nn.Conv2d(in_channels, out_channels, 1))
-            self.fpn_convs.append(nn.Conv2d(out_channels, out_channels, 3, padding=1))
-    
-    def forward(self, inputs):
-        laterals = [lateral_conv(x) for lateral_conv, x in zip(self.lateral_convs, inputs)]
-        
-        for i in range(len(laterals) - 2, -1, -1):
-            laterals[i] += F.interpolate(laterals[i + 1], size=laterals[i].shape[-2:], mode='nearest')
-        
-        outs = [fpn_conv(lateral) for fpn_conv, lateral in zip(self.fpn_convs, laterals)]
-        return outs
 
 
 class ArtifactStream(nn.Module):
@@ -90,21 +116,30 @@ class ArtifactStream(nn.Module):
         super().__init__()
         self.config = config
         
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.GroupNorm(32, 64)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        # 固定的 SRM 滤波器组
+        self.srm_filter = SRMFilter()
         
-        self.layer1 = self._make_layer(64, 256, 3, stride=1)
-        self.layer2 = self._make_layer(256, 512, 4, stride=2)
-        self.layer3 = self._make_layer(512, 1024, 6, stride=2)
+        # 极浅层轻量级 CNN
+        self.shallow_cnn = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU()
+        )
         
-        self.fpn = FPN([256, 512, 1024], 256)
-    
-    def _make_layer(self, in_channels, out_channels, num_blocks, stride):
-        layers = [ResidualBlock(in_channels, out_channels, stride)]
-        for _ in range(1, num_blocks):
-            layers.append(ResidualBlock(out_channels, out_channels))
-        return nn.Sequential(*layers)
+        # 全局平均池化
+        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
     
     def forward(self, x):
         """
@@ -114,21 +149,19 @@ class ArtifactStream(nn.Module):
             x: 输入图像张量，形状 [B, C, H, W]
 
         Returns:
-            List[torch.Tensor]: FPN多尺度特征列表，从高分辨率到低分辨率
-                - [0]: 高分辨率浅层特征，形状 [B, F, H/4, W/4]
-                - [1]: 中分辨率中层特征，形状 [B, F, H/8, W/8]
-                - [2]: 低分辨率深层特征，形状 [B, F, H/16, W/16]
+            torch.Tensor: 伪影特征，形状 [B, 128]
         """
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = self.maxpool(x)
+        # 应用 SRM 滤波器提取噪声残差
+        noise_residual = self.srm_filter(x)
         
-        c2 = self.layer1(x)
-        c3 = self.layer2(c2)
-        c4 = self.layer3(c3)
+        # 极浅层 CNN 提取高频统计特征
+        features = self.shallow_cnn(noise_residual)
         
-        fpn_features = self.fpn([c2, c3, c4])
+        # 全局平均池化
+        features = self.global_avg_pool(features)
+        features = features.flatten(1)
         
-        return fpn_features
+        return features
 
 
 class DualStreamEncoder(nn.Module):
@@ -147,9 +180,9 @@ class DualStreamEncoder(nn.Module):
             x: 输入图像张量，形状 [B, C, H, W]
 
         Returns:
-            Tuple[Dict[str, torch.Tensor], List[torch.Tensor]]:
+            Tuple[Dict[str, torch.Tensor], torch.Tensor]:
                 - 语义流特征字典
-                - 伪影流特征列表
+                - 伪影流特征
         """
         semantic_features = self.semantic_stream(x)
         artifact_features = self.artifact_stream(x)
