@@ -27,8 +27,8 @@ class Logger:
                 os.makedirs(log_dir, exist_ok=True)
                 # 可以自定义你的日志文件名，这里以时间戳命名为例
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                # 统一保存为 PLAA_MLLM_Training_xxx.log
-                log_file = os.path.join(log_dir, f"PLAA_MLLM_Training_{timestamp}.log") 
+                # 统一保存为 DS_MoME_Training_xxx.log
+                log_file = os.path.join(log_dir, f"DS_MoME_Training_{timestamp}.log") 
                 
                 # 创建文件处理器
                 file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')

@@ -1,4 +1,5 @@
 
+
 import os
 import json
 import torch
@@ -15,26 +16,23 @@ from utils.log_utils import Logger
 class AIGIDataset(Dataset):
     """
     AI生成图像检测数据集类
-    支持三种训练阶段的数据形态
     """
     
     def __init__(
         self,
         path_config,
         model_config,
-        stage=1,
         split="train",
         image_size=224,
         use_augmentation=True
     ):
         self.path_config = path_config
         self.model_config = model_config
-        self.stage = stage
         self.split = split
         self.image_size = image_size
         self.use_augmentation = use_augmentation and split == "train"
         
-        self.logger = Logger(name=f"AIGIDataset_{split}_stage{stage}")
+        self.logger = Logger(name=f"AIGIDataset_{split}")
         
         self.data_dir = os.path.join(path_config.data_dir, split)
         self.annotation_file = os.path.join(self.data_dir, "annotations_cleaned.json")
@@ -42,7 +40,7 @@ class AIGIDataset(Dataset):
         self.samples = self._load_annotations()
         self.transform = self._build_transform()
         
-        self.logger.info(f"Loaded {len(self.samples)} samples for {split} split (stage {stage})")
+        self.logger.info(f"Loaded {len(self.samples)} samples for {split} split")
     
     def _load_annotations(self):
         samples = []
@@ -67,23 +65,8 @@ class AIGIDataset(Dataset):
         for i in range(10):
             sample = {
                 "image_path": f"dummy_{i}.jpg",
-                "label": i % 2,
-                "stage": self.stage
+                "label": i % 2
             }
-            
-            if self.stage >= 2:
-                sample.update({
-                    "text_query": "Is this image AI-generated?",
-                    "mask": None,
-                    "expert_explanation": "This image contains typical AI artifacts."
-                })
-            
-            if self.stage >= 3:
-                sample.update({
-                    "winner": "Yes, this image appears to be AI-generated due to inconsistent textures.",
-                    "loser": "Maybe real?"
-                })
-            
             dummy_samples.append(sample)
         
         return dummy_samples
@@ -110,21 +93,6 @@ class AIGIDataset(Dataset):
         
         return transforms.Compose(transform_list)
     
-    def _build_mask_transform(self):
-        transform_list = []
-        
-        if self.use_augmentation:
-            transform_list.extend([
-                transforms.RandomResizedCrop(self.image_size, scale=(0.8, 1.0)),
-                transforms.RandomHorizontalFlip(p=0.5)
-            ])
-        else:
-            transform_list.append(transforms.Resize((self.image_size, self.image_size)))
-        
-        transform_list.append(transforms.ToTensor())
-        
-        return transforms.Compose(transform_list)
-    
     def __len__(self):
         return len(self.samples)
     
@@ -136,7 +104,7 @@ class AIGIDataset(Dataset):
         
         label = sample.get("label", 0)
         annotation_info = self._extract_annotation_info(sample)
-        text_prompt = self._get_text_prompt(sample)
+        text_prompt = self._get_text_prompt()
         
         return image, label, annotation_info, text_prompt
     
@@ -151,66 +119,15 @@ class AIGIDataset(Dataset):
         image_tensor = self.transform(image)
         return image_tensor
     
-    def _load_mask(self, mask_path_or_data):
-        # 1. 创建一个默认的全零 Tensor (1通道，大小为 image_size x image_size)
-        dummy_mask = torch.zeros((1, self.image_size, self.image_size))
-        
-        # 2. 如果数据为空，返回全零 Tensor 而不是 None
-        if mask_path_or_data is None:
-            return dummy_mask
-        
-        try:
-            if isinstance(mask_path_or_data, str):
-                full_path = os.path.join(self.data_dir, mask_path_or_data)
-                if os.path.exists(full_path):
-                    mask = Image.open(full_path).convert("L")
-                else:
-                    mask = Image.fromarray(np.uint8(np.zeros((256, 256))))
-            elif isinstance(mask_path_or_data, np.ndarray):
-                mask = Image.fromarray(mask_path_or_data.astype(np.uint8))
-            else:
-                mask = Image.fromarray(np.uint8(np.zeros((256, 256))))
-            
-            mask_transform = self._build_mask_transform()
-            mask_tensor = mask_transform(mask)
-            
-            return mask_tensor
-        except Exception as e:
-            self.logger.warning(f"Failed to load mask: {e}")
-            # 3. 如果发生异常加载失败，也返回全零 Tensor
-            return dummy_mask   
-        
     def _extract_annotation_info(self, sample):
         info = {
-            "image_path": sample.get("image_path", ""),
-            "stage": sample.get("stage", self.stage)
+            "image_path": sample.get("image_path", "")
         }
-        
-        if self.stage >= 2:
-            mask_data = sample.get("mask")
-            mask_tensor = self._load_mask(mask_data)
-            
-            info.update({
-                "text_query": sample.get("text_query", ""),
-                "expert_explanation": sample.get("expert_explanation", ""),
-                "mask": mask_tensor
-            })
-        
-        if self.stage >= 3:
-            info.update({
-                "winner": sample.get("winner", ""),
-                "loser": sample.get("loser", "")
-            })
-        
         return info
     
-    def _get_text_prompt(self, sample):
-        if self.stage == 1:
-            return "<image>\nAnalyze this image and determine if it is real or AI-generated. Please provide your reasoning."
-        elif self.stage == 2:
-            return "<image>\nAnalyze this image and determine if it is real or AI-generated. Please provide your reasoning."
-        else:
-            return sample.get("text_query", "Which answer is better?")
+    def _get_text_prompt(self):
+        return "<image>\nAnalyze this image and determine if it is real or AI-generated."
+
 
 class val_AIGIDataset(Dataset):
     def __init__(self, root_dir, transform=None):
@@ -250,7 +167,7 @@ class val_AIGIDataset(Dataset):
             image = self.transform(image)
             
         # 补充空字典和默认的文本 prompt，凑齐 4 个返回值，防止 Validator 解包报错
-        dummy_info = {"image_path": img_path, "stage": 2}
-        default_prompt = "<image>\nAnalyze this image and determine if it is real or AI-generated. Please provide your reasoning." 
+        dummy_info = {"image_path": img_path}
+        default_prompt = "<image>\nAnalyze this image and determine if it is real or AI-generated." 
             
         return image, label, dummy_info, default_prompt

@@ -17,14 +17,13 @@ from torch.utils.data import DataLoader
 from configs.model_config import ModelConfig
 from configs.device_config import DeviceConfig
 from configs.path_config import PathConfig
-from models.plaa_mllm import PLAAMLLM
+from models.ds_mome import DSMoME
 from data.dataset_loader import AIGIDataset, val_AIGIDataset
-from models.trainer import PLAAMLLMTrainer
+from models.trainer import DSMoMETrainer
 from models.validator import PLAAMLLMValidator
 from utils.metrics_utils import MetricsCalculator
 from utils.log_utils import Logger
 from torchvision import transforms
-from peft import LoraConfig, get_peft_model
 
 
 def parse_args() -> Namespace:
@@ -34,7 +33,7 @@ def parse_args() -> Namespace:
     Returns:
         Namespace: 解析后的命令行参数
     """
-    parser = argparse.ArgumentParser(description="PLAA-MLLM AI Generated Image Detection")
+    parser = argparse.ArgumentParser(description="DS-MoME AI Generated Image Detection")
     
     parser.add_argument(
         "--mode", 
@@ -60,13 +59,6 @@ def parse_args() -> Namespace:
         type=str, 
         default=None, 
         help="模型检查点路径"
-    )
-    parser.add_argument(
-        "--train_stage", 
-        type=int, 
-        default=1, 
-        choices=[1, 2, 3],
-        help="训练阶段: 1/2/3"
     )
     parser.add_argument(
         "--batch_size", 
@@ -120,10 +112,10 @@ def main() -> None:
         log_dir_to_use = path_config.logs_dir
 
     # 使用动态决定的路径初始化主 Logger
-    logger = Logger(name="PLAA_MLLM_Main", log_dir=log_dir_to_use)
+    logger = Logger(name="DS_MoME_Main", log_dir=log_dir_to_use)
 
     # 1. 实例化基础模型
-    model = PLAAMLLM(model_config, device_config, path_config)
+    model = DSMoME(model_config, device_config, path_config)
 
 
     # 单卡训练
@@ -138,55 +130,11 @@ def main() -> None:
     model.mome_fusion = model.mome_fusion.to(device)
     model.vision_token_proj = model.vision_token_proj.to(device)
     model.detection_head = model.detection_head.to(device)
-    model.mask_head = model.mask_head.to(device)
     # model.llm_infer 内部的 llm_model 已经通过 device_map="auto" 分布在两张卡上了，不要动它
 
     if args.checkpoint and os.path.exists(args.checkpoint):
         logger.info(f"Loading checkpoint from {args.checkpoint}")
-        
-        # 先读取 checkpoint 以判断是否包含 LoRA 阶段的权重
-        ckpt = torch.load(args.checkpoint, map_location='cpu')
-        state_dict = ckpt.get('model_state_dict', ckpt)
-        lora_weights = {k: v for k, v in state_dict.items() if 'lora' in k}
-        
-        # ==================== 【修复核心】按需注入 LoRA ====================
-        if len(lora_weights) > 0 and args.mode in ['val', 'inference']:
-            logger.info("Detected LoRA weights in checkpoint. Applying LoRA architecture...")
-            lora_config = LoraConfig(
-                r=model_config.lora_rank,
-                lora_alpha=model_config.lora_alpha,
-                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-                lora_dropout=0.05,
-                bias="none",
-                task_type="CAUSAL_LM"
-            )
-            model.llm_infer.llm_model = get_peft_model(model.llm_infer.llm_model, lora_config)
-        # =================================================================
-
         model.load_checkpoint(args.checkpoint)
-
-        # ==================== 终极诊断与强制加载代码 ====================
-        print("\n" + "="*60)
-        print("🔍 开始强制诊断与提取 LoRA 权重...")
-        
-        if len(lora_weights) > 0:
-            res = model.load_state_dict(lora_weights, strict=False)
-            missing_lora = [k for k in res.missing_keys if 'lora' in k]
-            print(f"2. 强制挂载执行完毕。未能成功对齐的 LoRA 参数数量: {len(missing_lora)}")
-            lora_b_sum = sum(p.abs().sum().item() for n, p in model.named_parameters() if 'lora_B' in n)
-            print(f"3. 当前模型中 LoRA_B 的权重绝对值之和为: {lora_b_sum}")
-            if lora_b_sum == 0.0:
-                print("🚨 致命异常：LoRA_B 权重全为 0！说明你第二阶段训练时代码有 Bug，梯度根本没传给 LoRA！")
-            else:
-                print("✅ LoRA 权重已成功激活并生效！")
-        else:
-            # 增加条件判断，防止从阶段1启动阶段2时误报
-            if args.mode == 'train' and args.train_stage == 2:
-                print("✅ 正常现象：正在从 Stage 1 检查点启动 Stage 2 训练，模型将自动初始化全新的 LoRA 权重。")
-            else:
-                print("🚨 警告：权重文件中不存在 LoRA 权重！(如果是推理阶段，请检查 checkpoint 是否正确)")
-        print("="*60 + "\n")
-        # ================================================================
 
     if args.mode == "train":
         train(model, args, logger, model_config, device_config, path_config)
@@ -197,7 +145,7 @@ def main() -> None:
 
 
 def train(
-    model: PLAAMLLM, 
+    model: PLAAMLLM
     args: Namespace, 
     logger: Logger,
     model_config: ModelConfig,
@@ -208,26 +156,26 @@ def train(
     训练模式
 
     Args:
-        model: PLAA-MLLM 模型
+        model: DS-MoME 模型
         args: 命令行参数
         logger: 日志记录器
         model_config: 模型配置
         device_config: 设备配置
         path_config: 路径配置
     """
-    logger.info(f"Starting training stage {args.train_stage}")      #日志第二条信息：开始训练阶段X
+    logger.info("Starting training")      #日志第二条信息：开始训练
 
     train_dataset = AIGIDataset(
-        path_config, model_config, stage=args.train_stage, split="train")   #日志第三条信息：加载训练数据集
+        path_config, model_config, split="train")   #日志第三条信息：加载训练数据集
     val_dataset = AIGIDataset(
-        path_config, model_config, stage=args.train_stage, split="val")
+        path_config, model_config, split="val")
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False)
 
-    trainer = PLAAMLLMTrainer(model, model_config, device_config, path_config, stage=args.train_stage)
+    trainer = DSMoMETrainer(model, model_config, device_config, path_config)
 
     trainer.train(
         train_loader=train_loader,
@@ -240,7 +188,7 @@ def train(
 
 
 def validate(
-    model: PLAAMLLM, 
+    model: PLAAALLMLM, 
     args: Namespace, 
     logger: Logger,
     model_config: ModelConfig,
@@ -273,7 +221,7 @@ def validate(
         path_config.TEST_DATA_DIR, transform=transform)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
-    validator = PLAAMLLMValidator(model, model_config, device_config, path_config)
+    validator = DSMoMEValidator(model, model_config, device_config, path_config)
     results = validator.validate(val_loader, save_results=True)
 
     #已经在validator中计算了指标，无需重复计算
@@ -288,7 +236,7 @@ def validate(
 
 
 def inference(
-    model: PLAAMLLM, 
+    model: PLAAALLMLM, 
     args: Namespace, 
     logger: Logger,
     model_config: ModelConfig,
@@ -299,7 +247,7 @@ def inference(
     推理模式
 
     Args:
-        model: PLAA-MLLM 模型
+        model: DS-MoME 模型
         args: 命令行参数
         logger: 日志记录器
         model_config: 模型配置
@@ -331,7 +279,7 @@ def inference(
 
 
 def _infer_single_image(
-    model: PLAAMLLM,
+    model: DSMoME,
     image_path: str,
     transform: transforms.Compose,
     device: torch.device,
@@ -341,7 +289,7 @@ def _infer_single_image(
     推理单张图像
 
     Args:
-        model: PLAA-MLLM 模型
+        model: DS-MoME 模型
         image_path: 图像路径
         transform: 图像变换
         device: 设备
@@ -352,13 +300,12 @@ def _infer_single_image(
         image_tensor = transform(image).unsqueeze(0).to(device)
         
         with torch.no_grad():
-            detection_score, explanation = model.detect_image(image_tensor)
+            detection_score = model.detect_image(image_tensor)
         
         logger.info("=" * 60)
         logger.info(f"Image: {os.path.basename(image_path)}")
         logger.info(f"Detection Score: {detection_score:.4f}")
         logger.info(f"Classification: {'AI-Generated' if detection_score > 0.5 else 'Real'}")
-        logger.info(f"Explanation: {explanation}")
         logger.info("=" * 60)
         
     except Exception as e:
@@ -366,7 +313,7 @@ def _infer_single_image(
 
 
 def _infer_batch_images(
-    model: PLAAMLLM,
+    model: DSMoME,
     image_dir: str,
     transform: transforms.Compose,
     device: torch.device,
@@ -377,7 +324,7 @@ def _infer_batch_images(
     批量推理图像
 
     Args:
-        model: PLAA-MLLM 模型
+        model: DS-MoME 模型
         image_dir: 图像目录
         transform: 图像变换
         device: 设备
@@ -398,13 +345,12 @@ def _infer_batch_images(
                 image_tensor = transform(image).unsqueeze(0).to(device)
                 
                 with torch.no_grad():
-                    detection_score, explanation = model.detect_image(image_tensor)
+                    detection_score = model.detect_image(image_tensor)
                 
                 result = {
                     'filename': filename,
                     'detection_score': float(detection_score),
-                    'is_ai_generated': bool(detection_score > 0.5),
-                    'explanation': explanation
+                    'is_ai_generated': bool(detection_score > 0.5)
                 }
                 results.append(result)
                 

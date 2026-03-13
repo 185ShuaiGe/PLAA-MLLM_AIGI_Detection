@@ -10,7 +10,7 @@ from models.mome_fusion import MoMEFusion
 from models.llm_infer import LLMInference
 
 
-class PLAAMLLM(nn.Module):
+class DSMoME(nn.Module):
     def __init__(self, model_config, device_config, path_config):
         super().__init__()
         self.model_config = model_config
@@ -28,12 +28,6 @@ class PLAAMLLM(nn.Module):
             nn.GELU(),
             nn.Linear(model_config.llm_dim // 2, 1)
         )
-        
-        self.mask_head = nn.Sequential(
-            nn.Linear(model_config.llm_dim, model_config.latent_dim),
-            nn.GELU(),
-            nn.Linear(model_config.latent_dim, 224 * 224)
-        )
 
     def forward(self, image, text_prompt, text_guidance=None):
         # 自动判断视觉编码器是否被冻结，若冻结则不记录梯度图，省下海量中间激活值的显存
@@ -45,7 +39,6 @@ class PLAAMLLM(nn.Module):
         projected_vision_tokens = None
         pooled_vision = None
         detection_logits = None
-        pred_mask = None
         
         with torch.set_grad_enabled(visual_requires_grad):
             semantic_features, artifact_features = self.dual_stream_encoder(image)
@@ -60,14 +53,6 @@ class PLAAMLLM(nn.Module):
             
             pooled_vision = projected_vision_tokens.mean(dim=1)
             detection_logits = self.detection_head(pooled_vision)
-            
-            # （plaa_mllm.py forward 函数的后半部分）
-            pred_mask = None
-            try:
-                mask_flat = self.mask_head(pooled_vision)
-                pred_mask = mask_flat.view(-1, 1, 224, 224)
-            except:
-                pass
         
         llm_outputs = {}
         # 即使 LLM 被冻结，也必须执行前向传播以实现特征对齐
@@ -93,7 +78,6 @@ class PLAAMLLM(nn.Module):
         return {
             'vision_tokens': projected_vision_tokens,
             'detection_logits': detection_logits,
-            'pred_mask': pred_mask,
             **llm_outputs
         }
 
@@ -102,29 +86,13 @@ class PLAAMLLM(nn.Module):
         with torch.no_grad():
             # ======== 【核心修复 1】：加入与训练时完全相同的 bfloat16 混合精度 ========
             with torch.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = self.forward(image, "<image>\nAnalyze this image and determine if it is real or AI-generated. Please provide your reasoning.", text_guidance)
+                outputs = self.forward(image, "<image>\nAnalyze this image and determine if it is real or AI-generated.", text_guidance)
                 
-                projected_vision_tokens = outputs.get('vision_tokens')
                 detection_logits = outputs.get('detection_logits')
                 confidence = torch.sigmoid(detection_logits).item() if detection_logits is not None else 0.5
-                
-                if text_guidance is None:
-                    prompt = "<image>\nAnalyze this image and determine if it is real or AI-generated. Please provide your reasoning."
-                else:
-                    prompt = text_guidance
-                    
-                try:
-                    explanation = self.llm_infer.generate_explanation(
-                        image_features=projected_vision_tokens, 
-                        detection_score=confidence, 
-                        prompt=prompt
-                    )
-                except Exception as e:
-                    print(f"Explanation Generation Error: {e}")
-                    explanation = "AI-generated" if confidence > 0.5 else "Real"
             # =====================================================================
         
-        return confidence, explanation
+        return confidence
 
     def _early_fusion(self, vision_tokens, text_tokens):
         input_ids = text_tokens['input_ids']
@@ -162,8 +130,8 @@ class PLAAMLLM(nn.Module):
                 # 1. 自动剥离多卡训练 (DDP) 产生的 module. 前缀，或 torch.compile 产生的 _orig_mod. 前缀
                 clean_k = k.replace('module.', '').replace('_orig_mod.', '')
                 
-                # 2. 过滤掉 LLM 冻结的主干权重，但必须保留 LoRA 权重
-                if clean_k.startswith('llm_infer.llm_model.') and 'lora' not in clean_k:
+                # 2. 过滤掉 LLM 冻结的主干权重
+                if clean_k.startswith('llm_infer.llm_model.'):
                     continue
                     
                 filtered_state_dict[clean_k] = v
@@ -182,7 +150,7 @@ class PLAAMLLM(nn.Module):
             # =======================================================================
             
         except Exception as e:
-            print(f"Error loading checkpoint in PLAAMLLM: {e}")
+            print(f"Error loading checkpoint in DSMoME: {e}")
 
     def save_checkpoint(self, checkpoint_path):
         try:

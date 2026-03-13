@@ -7,7 +7,7 @@ from tqdm import tqdm
 from configs.model_config import ModelConfig
 from configs.device_config import DeviceConfig
 from configs.path_config import PathConfig
-from models.plaa_mllm import PLAAMLLM
+from models.ds_mome import DSMoME
 from data.dataset_loader import AIGIDataset
 from utils.log_utils import Logger
 
@@ -15,14 +15,14 @@ from utils.log_utils import Logger
 from utils.metrics_utils import MetricsCalculator
 
 
-class PLAAMLLMValidator:
+class DSMoMEValidator:
     """
-    PLAA-MLLM 模型验证器
+    DS-MoME 模型验证器
     """
     
     def __init__(
         self,
-        model: PLAAMLLM,
+        model: DSMoME,
         model_config: ModelConfig,
         device_config: DeviceConfig,
         path_config: PathConfig
@@ -31,7 +31,7 @@ class PLAAMLLMValidator:
         初始化验证器
         
         Args:
-            model: PLAA-MLLM 模型
+            model: DS-MoME 模型
             model_config: 模型配置
             device_config: 设备配置
             path_config: 路径配置
@@ -141,19 +141,12 @@ class PLAAMLLMValidator:
         else:
             detection_result = 0.5
         
-        pred_mask = outputs.get('pred_mask', None)
-        explanation = outputs.get('explanation', '')
-        
         result = {
             'image_path': annotation_info.get('image_path', ''),
             'true_label': int(label) if isinstance(label, torch.Tensor) else label,
             'pred_score': float(detection_result) if isinstance(detection_result, torch.Tensor) else detection_result,
-            'explanation': explanation,
             'annotation': annotation_info
         }
-        
-        if pred_mask is not None:
-            result['pred_mask'] = pred_mask.cpu().numpy().tolist() if isinstance(pred_mask, torch.Tensor) else pred_mask
         
         return result
     

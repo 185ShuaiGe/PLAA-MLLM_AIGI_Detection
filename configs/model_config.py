@@ -13,8 +13,6 @@ class ModelConfig:
     num_latent_queries = 128
     latent_dim = 512
     num_attention_heads = 8
-    cross_attention_heads = 8
-    cross_attention_layers = 6
 
     #local
     # llm_model_name = "D:\\cache\\huggingface_cache\\hub\\models--meta-llama--Meta-Llama-3.1-8B-Instruct"    
@@ -23,9 +21,12 @@ class ModelConfig:
     
     llm_dim = 4096
     use_text_guidance = True
-    lora_rank = 32
-    lora_alpha = 64
     grad_accum_steps = 8
     max_seq_len = 1024
     hidden_dim = 1024
     dropout = 0.1
+    
+    # Ablation study switches
+    use_resnet_artifact = False
+    use_cross_attention = False
+    enable_text_loss = False
