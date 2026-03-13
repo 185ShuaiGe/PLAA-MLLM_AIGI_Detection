@@ -20,7 +20,7 @@ from configs.path_config import PathConfig
 from models.ds_mome import DSMoME
 from data.dataset_loader import AIGIDataset, val_AIGIDataset
 from models.trainer import DSMoMETrainer
-from models.validator import PLAAMLLMValidator
+from models.validator import DSMoMEValidator
 from utils.metrics_utils import MetricsCalculator
 from utils.log_utils import Logger
 from torchvision import transforms
@@ -145,7 +145,7 @@ def main() -> None:
 
 
 def train(
-    model: PLAAMLLM
+    model: DSMoME,
     args: Namespace, 
     logger: Logger,
     model_config: ModelConfig,
@@ -188,7 +188,7 @@ def train(
 
 
 def validate(
-    model: PLAAALLMLM, 
+    model: DSMoME, 
     args: Namespace, 
     logger: Logger,
     model_config: ModelConfig,
@@ -236,7 +236,7 @@ def validate(
 
 
 def inference(
-    model: PLAAALLMLM, 
+    model: DSMoME, 
     args: Namespace, 
     logger: Logger,
     model_config: ModelConfig,

@@ -113,8 +113,9 @@ class DSMoMETrainer:
         trainable_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         self.logger.info(f"Trainable parameters after unfreezing: {trainable_count:,}")
     
-    def compute_loss(self, outputs, labels):
+    def compute_loss(self, outputs, labels, text_input_ids=None, text_attention_mask=None):
         loss_dict = {}
+        total_loss = 0.0
         
         # 计算检测损失
         detection_logits = outputs.get('detection_logits', None)
@@ -123,10 +124,31 @@ class DSMoMETrainer:
             detection_logits = detection_logits.view(-1).to(torch.float32)
             bce_loss = F.binary_cross_entropy_with_logits(detection_logits, labels)
             loss_dict['bce_loss'] = bce_loss
-            loss_dict['total_loss'] = bce_loss
-        else:
-            dummy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-            loss_dict['total_loss'] = dummy_loss
+            total_loss += bce_loss
+        
+        # 计算 CLM Loss（仅当 enable_text_loss 为 True 时）
+        if hasattr(self.model_config, 'enable_text_loss') and self.model_config.enable_text_loss:
+            llm_logits = outputs.get('logits', None)
+            if llm_logits is not None and text_input_ids is not None:
+                # CLM Loss: 预测下一个 token
+                # 将 logits 和 labels 移动到同一设备
+                llm_logits = llm_logits.to(self.device)
+                text_input_ids = text_input_ids.to(self.device)
+                
+                # Shift logits and labels for next-token prediction
+                shift_logits = llm_logits[..., :-1, :].contiguous()
+                shift_labels = text_input_ids[..., 1:].contiguous()
+                
+                # Compute loss
+                clm_loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=self.tokenizer.pad_token_id if self.tokenizer is not None else -100
+                )
+                loss_dict['clm_loss'] = clm_loss
+                total_loss += clm_loss
+        
+        loss_dict['total_loss'] = total_loss if total_loss != 0 else torch.tensor(0.0, device=self.device, requires_grad=True)
         
         return loss_dict
     
@@ -215,9 +237,23 @@ class DSMoMETrainer:
             images = images.to(self.device)
             labels_tensor = labels.to(self.device).float() if isinstance(labels, torch.Tensor) else torch.tensor(labels, device=self.device).float()
             
+            # Tokenize text prompts if needed for CLM loss
+            text_input_ids = None
+            text_attention_mask = None
+            if hasattr(self.model_config, 'enable_text_loss') and self.model_config.enable_text_loss and self.tokenizer is not None:
+                tokenized = self.tokenizer(
+                    text_prompts,
+                    return_tensors='pt',
+                    padding=True,
+                    truncation=True,
+                    max_length=self.model_config.max_seq_len
+                )
+                text_input_ids = tokenized['input_ids']
+                text_attention_mask = tokenized['attention_mask']
+            
             with torch.autocast(device_type='cuda', dtype=torch.float16):
                 outputs = self.model(images, "<image>\nAnalyze this image and determine if it is real or AI-generated.")
-                loss_dict = self.compute_loss(outputs, labels_tensor)
+                loss_dict = self.compute_loss(outputs, labels_tensor, text_input_ids, text_attention_mask)
             
             loss = loss_dict['total_loss']
 
@@ -235,7 +271,11 @@ class DSMoMETrainer:
             actual_loss = loss.item() * accum_steps
             total_loss += actual_loss
             self.global_step += 1
-            progress_bar.set_postfix({'loss': f"{actual_loss:.4f}"})
+            # 更新进度条显示更多信息
+            postfix = {'loss': f"{actual_loss:.4f}"}
+            if 'clm_loss' in loss_dict:
+                postfix['clm'] = f"{loss_dict['clm_loss'].item():.4f}"
+            progress_bar.set_postfix(postfix)
             
         return total_loss / len(loader)
     

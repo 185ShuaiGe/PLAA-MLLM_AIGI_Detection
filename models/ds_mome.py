@@ -37,7 +37,6 @@ class DSMoME(nn.Module):
         artifact_features = None
         vision_tokens = None
         projected_vision_tokens = None
-        pooled_vision = None
         detection_logits = None
         
         with torch.set_grad_enabled(visual_requires_grad):
@@ -50,9 +49,6 @@ class DSMoME(nn.Module):
             )
             
             projected_vision_tokens = self.vision_token_proj(vision_tokens)
-            
-            pooled_vision = projected_vision_tokens.mean(dim=1)
-            detection_logits = self.detection_head(pooled_vision)
         
         llm_outputs = {}
         # 即使 LLM 被冻结，也必须执行前向传播以实现特征对齐
@@ -72,8 +68,24 @@ class DSMoME(nn.Module):
                     vision_tokens=projected_vision_tokens
                 )
                 llm_outputs.update(llm_out)
+                
+                # 从 LLM 的最后隐藏状态中获取特征来计算分类头
+                last_hidden_state = llm_out.get('last_hidden_state', None)
+                if last_hidden_state is not None:
+                    # 使用最后一个 token 的隐藏状态或者平均池化所有隐藏状态
+                    pooled_llm = last_hidden_state.mean(dim=1)
+                    # 将 LLM 的隐藏状态转移到 detection_head 所在的设备
+                    pooled_llm = pooled_llm.to(self.detection_head[0].weight.device)
+                    detection_logits = self.detection_head(pooled_llm)
+                else:
+                    # 备用方案：如果 LLM 没有返回隐藏状态，继续使用视觉特征
+                    pooled_vision = projected_vision_tokens.mean(dim=1)
+                    detection_logits = self.detection_head(pooled_vision)
         except Exception as e:
             print(f"Error in LLM forward pass: {e}")
+            # 备用方案：如果 LLM 前向失败，继续使用视觉特征
+            pooled_vision = projected_vision_tokens.mean(dim=1)
+            detection_logits = self.detection_head(pooled_vision)
         
         return {
             'vision_tokens': projected_vision_tokens,

@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 from typing import Optional, Dict, Any
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from peft import LoraConfig, get_peft_model
 from configs.model_config import ModelConfig
 from configs.device_config import DeviceConfig
 
@@ -26,17 +25,15 @@ class LLMInference(nn.Module):
             
             self.llm_model = AutoModelForCausalLM.from_pretrained(
                 config.llm_model_name,
-                # torch_dtype=torch.float16,
-                quantization_config=quantization_config, # 使用量化配置
+                quantization_config=quantization_config,
                 device_map="auto",        
-                max_memory={0: "23GiB", 1: "0GiB"} #限制 GPU 0 的最大显存使用量，强制剩余部分溢出到 GPU 1 
+                max_memory={0: "23GiB", 1: "0GiB"}
             )
         except Exception as e:
             print(f"Error loading LLM: {e}")
             self.llm_model = None 
         # ------------------------------
         self.tokenizer = None
-        self.lora_config = None
         
         self.device = device_config.get_device()
         self._init_tokenizer()
@@ -74,6 +71,7 @@ class LLMInference(nn.Module):
             Dict[str, torch.Tensor]: LLM 输出字典
                 - 'logits': 输出 logits，形状 [B, N+T, V]，V=vocab_size
                     注意：序列长度为 N（视觉令牌数量）+ T（文本令牌数量）
+                - 'last_hidden_state': LLM 最后一层的隐藏状态
                 - 'loss': 可选的损失值（训练时）
         """
         if self.llm_model is None:
@@ -110,15 +108,20 @@ class LLMInference(nn.Module):
         if inputs_embeds is not None:
             outputs = self.llm_model(
                 inputs_embeds=inputs_embeds,
-                attention_mask=fused_attention_mask
+                attention_mask=fused_attention_mask,
+                output_hidden_states=True
             )
         else:
             outputs = self.llm_model(
                 input_ids=input_ids,
-                attention_mask=attention_mask
+                attention_mask=attention_mask,
+                output_hidden_states=True
             )
         
-        return {'logits': outputs.logits}
+        return {
+            'logits': outputs.logits,
+            'last_hidden_state': outputs.hidden_states[-1] if hasattr(outputs, 'hidden_states') else None
+        }
     
     def generate(
         self,
@@ -244,31 +247,3 @@ class LLMInference(nn.Module):
         text = text[0].upper() + text[1:] if text else text
         
         return text
-    
-    def _init_lora(self) -> None:
-        """
-        初始化 LoRA 配置
-
-        设置 LoraConfig，包括 rank、alpha、target_modules 等参数
-        """
-        if self.llm_model is not None:
-            self.lora_config = LoraConfig(
-                r=self.config.lora_rank,
-                lora_alpha=self.config.lora_alpha,
-                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-                lora_dropout=0.05,
-                bias="none",
-                task_type="CAUSAL_LM"
-            )
-    
-    def _apply_lora(self) -> None:
-        """
-        应用 LoRA 到 LLM 模型
-
-        使用 peft.get_peft_model 将 LoRA 适配器注入到 LLM 中
-        """
-        if self.llm_model is not None and self.lora_config is not None:
-            try:
-                self.llm_model = get_peft_model(self.llm_model, self.lora_config)
-            except Exception as e:
-                print(f"Error applying LoRA: {e}")
