@@ -29,8 +29,6 @@ from configs.model_config import ModelConfig
 from configs.device_config import DeviceConfig
 from configs.path_config import PathConfig
 from models.ds_mome import DSMoME
-from peft import LoraConfig, get_peft_model
-
 # 忽略烦人的警告
 warnings.filterwarnings('ignore')
 
@@ -79,30 +77,11 @@ def main():
     model.mome_fusion = model.mome_fusion.to(device)
     model.vision_token_proj = model.vision_token_proj.to(device)
     model.detection_head = model.detection_head.to(device)
-    # 如果你在后续更新中删除了 mask_head，请把下面这行注释掉；如果还在则保留
-    if hasattr(model, 'mask_head') and model.mask_head is not None:
-        model.mask_head = model.mask_head.to(device)
+    
 
     # 2. 加载权重 (包含自动兼容 Stage 2 LoRA 的逻辑)
     print("⏳ 正在加载权重...")
     if os.path.exists(MODEL_PATH):
-        ckpt = torch.load(MODEL_PATH, map_location='cpu')
-        state_dict = ckpt.get('model_state_dict', ckpt)
-        lora_weights = {k: v for k, v in state_dict.items() if 'lora' in k}
-        
-        # 如果你后续用 stage 2 的权重测试，这部分会自动加载 LoRA
-        if len(lora_weights) > 0:
-            print("Detected LoRA weights. Applying LoRA architecture...")
-            lora_config = LoraConfig(
-                r=model_config.lora_rank,
-                lora_alpha=model_config.lora_alpha,
-                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-                lora_dropout=0.05,
-                bias="none",
-                task_type="CAUSAL_LM"
-            )
-            model.llm_infer.llm_model = get_peft_model(model.llm_infer.llm_model, lora_config)
-
         model.load_checkpoint(MODEL_PATH)
     else:
         print(f"❌ 找不到权重文件: {MODEL_PATH}")

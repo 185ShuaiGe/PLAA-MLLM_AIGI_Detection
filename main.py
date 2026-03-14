@@ -48,7 +48,7 @@ from configs.model_config import ModelConfig
 from configs.device_config import DeviceConfig
 from configs.path_config import PathConfig
 from models.ds_mome import DSMoME
-from data.dataset_loader import AIGIDataset, val_AIGIDataset
+from data.dataset_loader import get_holmes_dataloaders, val_AIGIDataset
 from models.trainer import DSMoMETrainer
 from models.validator import DSMoMEValidator
 from utils.log_utils import Logger
@@ -149,16 +149,9 @@ def train(
     path_config: PathConfig
 ) -> None:
     logger.info("Starting training")
-
-    train_dataset = AIGIDataset(
-        path_config, model_config, split="train")
-    val_dataset = AIGIDataset(
-        path_config, model_config, split="val")
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False)
+    train_loader, val_loader = get_holmes_dataloaders(
+        path_config, model_config, batch_size=args.batch_size
+    )
 
     trainer = DSMoMETrainer(model, model_config, device_config, path_config)
 

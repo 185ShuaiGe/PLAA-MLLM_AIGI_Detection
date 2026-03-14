@@ -114,32 +114,6 @@ class DSMoME(nn.Module):
         
         return confidence
 
-    def _early_fusion(self, vision_tokens, text_tokens):
-        input_ids = text_tokens['input_ids']
-        attention_mask = text_tokens['attention_mask']
-        
-        try:
-            text_embeds = self.llm_infer.llm_model.get_input_embeddings()(input_ids)
-        except:
-            text_embeds = torch.zeros(
-                input_ids.shape[0],
-                input_ids.shape[1],
-                self.model_config.llm_dim,
-                device=input_ids.device
-            )
-        
-        inputs_embeds = torch.cat([vision_tokens, text_embeds], dim=1)
-        
-        vision_attention_mask = torch.ones(
-            vision_tokens.shape[0],
-            vision_tokens.shape[1],
-            device=attention_mask.device,
-            dtype=attention_mask.dtype
-        )
-        fused_attention_mask = torch.cat([vision_attention_mask, attention_mask], dim=1)
-        
-        return inputs_embeds, fused_attention_mask
-
     def load_checkpoint(self, checkpoint_path):
         try:
             checkpoint = torch.load(checkpoint_path, map_location=self.device_config.get_device())

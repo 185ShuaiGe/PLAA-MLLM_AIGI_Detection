@@ -1,27 +1,27 @@
-
-
 import os
 import json
 import torch
 import numpy as np
+import random
 from PIL import Image
 from typing import Dict, List, Tuple, Optional, Any
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from configs.path_config import PathConfig
 from configs.model_config import ModelConfig
 from utils.log_utils import Logger
 
-
 class AIGIDataset(Dataset):
     """
-    AI生成图像检测数据集类
+    AI生成图像检测数据集类 (支持内存列表动态加载)
     """
     
     def __init__(
         self,
         path_config,
         model_config,
+        data_list,            # 新增：接收切分好的数据列表
+        base_img_dir,         # 新增：图片根目录路径
         split="train",
         image_size=224,
         use_augmentation=True
@@ -31,46 +31,15 @@ class AIGIDataset(Dataset):
         self.split = split
         self.image_size = image_size
         self.use_augmentation = use_augmentation and split == "train"
+        self.base_img_dir = base_img_dir
         
         self.logger = Logger(name=f"AIGIDataset_{split}")
         
-        self.data_dir = os.path.join(path_config.data_dir, split)
-        self.annotation_file = os.path.join(self.data_dir, "annotations_cleaned.json")
-        
-        self.samples = self._load_annotations()
+        self.samples = data_list
         self.transform = self._build_transform()
         
-        self.logger.info(f"Loaded {len(self.samples)} samples for {split} split")
-    
-    def _load_annotations(self):
-        samples = []
-        
-        if os.path.exists(self.annotation_file):
-            try:
-                with open(self.annotation_file, 'r', encoding='utf-8') as f:
-                    annotations = json.load(f)
-                samples = annotations.get("samples", [])
-            except Exception as e:
-                self.logger.warning(f"Failed to load annotations: {e}")
-        
-        if not samples:
-            self.logger.warning("No annotations found, using dummy data")
-            samples = self._generate_dummy_samples()
-        
-        return samples
-    
-    def _generate_dummy_samples(self):
-        dummy_samples = []
-        
-        for i in range(10):
-            sample = {
-                "image_path": f"dummy_{i}.jpg",
-                "label": i % 2
-            }
-            dummy_samples.append(sample)
-        
-        return dummy_samples
-    
+        self.logger.info(f"Initialized {split} dataset with {len(self.samples)} samples")
+
     def _build_transform(self):
         transform_list = []
         
@@ -99,36 +68,82 @@ class AIGIDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         
-        # 直接加载图片，如果找不到文件，让程序直接崩溃退出！
-        image = self._load_image(sample.get("image_path", ""))
+        # 1. 拼接图片绝对路径
+        # sample['images'][0] 形如 "./holmes_dataset/dataset_huggingface/1_fake/xxx.png"
+        # lstrip 去掉前面的 "./" 避免拼接错误
+        rel_img_path = sample['images'][0].lstrip("./") 
+        full_img_path = os.path.join(self.base_img_dir, rel_img_path)
         
+        # 2. 加载图片
+        image = self._load_image(full_img_path)
+        
+        # 3. 获取纯净的二元标签
         label = sample.get("label", 0)
-        annotation_info = self._extract_annotation_info(sample)
-        text_prompt = self._get_text_prompt()
+        
+        annotation_info = {"image_path": full_img_path}
+        text_prompt = sample.get("query", "<image>\nAnalyze this image and determine if it is real or AI-generated.")
         
         return image, label, annotation_info, text_prompt
     
-    def _load_image(self, image_path):
-        full_path = os.path.join(self.data_dir, image_path)
-        
+    def _load_image(self, full_path):
         if not os.path.exists(full_path):
-            # 抛出明确的异常，让你知道哪里的路径错了，而不是塞入随机图片
             raise FileNotFoundError(f"Image not found at: {os.path.abspath(full_path)}")
             
         image = Image.open(full_path).convert("RGB")
         image_tensor = self.transform(image)
         return image_tensor
-    
-    def _extract_annotation_info(self, sample):
-        info = {
-            "image_path": sample.get("image_path", "")
-        }
-        return info
-    
-    def _get_text_prompt(self):
-        return "<image>\nAnalyze this image and determine if it is real or AI-generated."
 
 
+def get_holmes_dataloaders(path_config, model_config, batch_size=32):
+    """
+    负责读取 clean-data.json 并在每次训练时动态划分 9:1
+    """
+    json_path = os.path.join(path_config.data_dir, "clean-data.json")
+    base_img_dir = path_config.data_dir
+    
+    print(f"Loading dataset metadata from: {json_path}")
+    with open(json_path, 'r', encoding='utf-8') as f:
+        all_data = json.load(f)
+        
+    # 设定固定的随机种子，保证如果训练中断，重启时训练集/验证集的划分是一致的，防止数据穿越
+    random.seed(42)
+    random.shuffle(all_data)
+    
+    total_size = len(all_data)
+    train_size = int(0.9 * total_size)
+    val_size = total_size - train_size
+    
+    print("=" * 60)
+    print("📊 Dataset Split Information (9:1 Dynamic Split)")
+    print(f"  Total valid samples: {total_size}")
+    print(f"  Training samples:    {train_size}")
+    print(f"  Validation samples:  {val_size}")
+    print("=" * 60)
+    
+    # 划分列表
+    train_list = all_data[:train_size]
+    val_list = all_data[train_size:]
+    
+    # 实例化数据集 (验证集关闭数据增强)
+    train_dataset = AIGIDataset(
+        path_config, model_config, 
+        data_list=train_list, base_img_dir=base_img_dir, 
+        split="train"
+    )
+    val_dataset = AIGIDataset(
+        path_config, model_config, 
+        data_list=val_list, base_img_dir=base_img_dir, 
+        split="val", use_augmentation=False
+    )
+    
+    # 创建 DataLoader
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    
+    return train_loader, val_loader
+
+
+# ========================== 下方完全保留你的原始代码，请勿修改 ==========================
 class val_AIGIDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.image_paths = []
