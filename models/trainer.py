@@ -9,6 +9,7 @@ import torch.backends.cudnn as cudnn
 # 👇【新增这行】：强制禁用 cuDNN，绕过 RTX40 系列显卡在混合精度下的 NaN Bug
 cudnn.enabled = True
 
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
@@ -18,6 +19,7 @@ from transformers import AutoTokenizer
 from configs.model_config import ModelConfig
 from configs.device_config import DeviceConfig
 from configs.path_config import PathConfig
+from configs.ablation_config import AblationConfig
 from models.ds_mome import DSMoME
 from data.dataset_loader import AIGIDataset
 from utils.log_utils import Logger
@@ -35,12 +37,15 @@ class DSMoMETrainer:
         model,
         model_config,
         device_config,
-        path_config
+        path_config,
+        args
     ):
         self.model = model
         self.model_config = model_config
         self.device_config = device_config
         self.path_config = path_config
+
+        self.args = args
         
         self.logger = Logger(name="Trainer")
         self.device_manager = DeviceManager(device_config)
@@ -55,9 +60,9 @@ class DSMoMETrainer:
         self.global_step = 0
         self.epoch = 0
 
-        # 初始化 GradScaler
-        # self.scaler = torch.cuda.amp.GradScaler(enabled=True)
+        self.start_time_str = datetime.now().strftime("%m%d-%H%M")
         
+        # 记录本次运行【开始时】的时间戳 (格式: 月日-时分，例如 0314-1530)
         self._setup_training()
     
     def _init_tokenizer(self):
@@ -154,6 +159,7 @@ class DSMoMETrainer:
     
     def train(self, train_loader, val_loader=None, num_epochs=3, learning_rate=1e-4, batch_size=4, checkpoint_path=None):
         self.logger.info("Starting training")
+
         
         optimizer = AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
@@ -279,7 +285,6 @@ class DSMoMETrainer:
             
         return total_loss / len(loader)
     
-
     def _validate_epoch(self, loader):
         self.model.eval()
         total_loss = 0.0
@@ -314,30 +319,48 @@ class DSMoMETrainer:
         return total_loss / len(loader), all_true_labels, all_pred_scores 
     
     def _save_checkpoint(self, optimizer, scheduler, is_best=False):
+        # 1. 核心要求：不再每个 epoch 都保存依次权重，只保存效果最好的！
+        if not is_best:
+            return
+
+        # 2. 获取当前的消融组别名称
+        exp_id = AblationConfig.EXPERIMENT_ID
+
+        # 3. 动态判断保存路径 (根目录下的 weights 文件夹)
+        # 假设 self.path_config.weights_dir 指向 "./weights"
+        if exp_id == 'final':
+            save_dir = os.path.join(self.path_config.weights_dir, 'final')
+        else:
+            save_dir = os.path.join(self.path_config.weights_dir, 'ablation')
+
+        # 确保目录存在
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 4. 获取运行轮数 (epochs) 和 当前学习率 (lr)
+        total_epochs = self.args.num_epochs  # 根据你的 config 属性名调整
+        current_lr = self.args.lr
+
+        # 5. 拼接文件名：组别-时间戳-epochs-学习率.pt
+        filename = f"{exp_id}-{self.start_time_str}-{total_epochs}-{current_lr}.pt"
+        
+        best_path = os.path.join(save_dir, filename)
+
+        # 6. 打包保存
         checkpoint = {
             'epoch': self.epoch,
-            'global_step': self.global_step,
+            'global_step': getattr(self, 'global_step', 0),
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
-            'best_metric': self.best_metric
+            'best_metric': getattr(self, 'best_metric', None)
         }
+
+        torch.save(checkpoint, best_path)
         
-        save_path = os.path.join(
-            self.path_config.weights_dir,
-            'checkpoint_latest.pt'
-        )
-        
-        torch.save(checkpoint, save_path)
-        self.logger.info(f"Checkpoint saved to {save_path}")
-        
-        if is_best:
-            best_path = os.path.join(
-                self.path_config.weights_dir,
-                'checkpoint_best.pt'
-            )
-            torch.save(checkpoint, best_path)
-            self.logger.info(f"Best checkpoint saved to {best_path}")
+        if hasattr(self, 'logger'):
+            self.logger.info(f"🏆 最佳权重已保存至: {best_path}")
+        else:
+            print(f"🏆 最佳权重已保存至: {best_path}")
     
     def _load_checkpoint(self, checkpoint_path, optimizer, scheduler):
         #先将权重加载到 CPU 上，避免 GPU 内存不足

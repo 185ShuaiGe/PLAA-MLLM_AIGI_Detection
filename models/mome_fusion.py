@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import Dict, List, Optional, Tuple
 from configs.model_config import ModelConfig
 from configs.device_config import DeviceConfig
-
+from configs.ablation_config import AblationConfig
 
 class MoMEFusion(nn.Module):
     """
@@ -24,6 +24,13 @@ class MoMEFusion(nn.Module):
         
         # 伪影特征投影
         self.artifact_proj = nn.Linear(128, self.latent_dim)
+
+        # 传统 MLP 融合 - 考虑消融实验
+        self.traditional_mlp_fusion = nn.Sequential(
+            nn.Linear(self.latent_dim * 2, self.latent_dim),
+            nn.ReLU(),
+            nn.Linear(self.latent_dim, self.latent_dim)
+        )
         
         # 构建专家池
         self.experts = nn.ModuleDict({
@@ -72,45 +79,43 @@ class MoMEFusion(nn.Module):
         Returns:
             torch.Tensor: 融合后的视觉取证 tokens
         """
-        first_feat = list(semantic_features.values())[0]
-        device = first_feat.device
-        batch_size = first_feat.size(0)
+        ref_feat = list(semantic_features.values())[0] if semantic_features is not None else artifact_features
+        device = ref_feat.device
+        batch_size = ref_feat.size(0)
         
-        # 处理语义特征 - 融合多尺度特征
-        semantic_feats = []
-        for layer_name, feat in semantic_features.items():
-            cls_token = feat[:, 0, :]  # 提取每一层的 CLS token
-            semantic_feats.append(cls_token)
-        
-        # 拼接多尺度特征
-        semantic_feat = torch.cat(semantic_feats, dim=1)
-        semantic_feat = self.semantic_proj(semantic_feat)
-        
-        # 处理伪影特征
-        artifact_feat = self.artifact_proj(artifact_features)
-        
-        # 特征拼接形成联合视觉序列
-        joint_feat = torch.cat([semantic_feat, artifact_feat], dim=1)
-        
-        # 动态软路由门控
-        gate_weights = self.gate_network(joint_feat)
-        
-        # 专家混合
-        expert_outputs = []
-        for expert_name, expert in self.experts.items():
-            expert_out = expert(joint_feat)
-            expert_outputs.append(expert_out)
-        
-        expert_outputs = torch.stack(expert_outputs, dim=1)  # [B, num_experts, latent_dim]
-        gate_weights = gate_weights.unsqueeze(-1)  # [B, num_experts, 1]
-        
-        # 加权融合
-        fused_feat = torch.sum(expert_outputs * gate_weights, dim=1)  # [B, latent_dim]
-        
-        # 应用输出投影
-        fused_feat = self.output_proj(fused_feat)
-        
-        # 扩展为 tokens 格式
+        # 特征预处理
+        semantic_feat = None
+        if semantic_features is not None:
+            semantic_feats = [feat[:, 0, :] for feat in semantic_features.values()]
+            semantic_feat = self.semantic_proj(torch.cat(semantic_feats, dim=1))
+            
+        artifact_feat = None
+        if artifact_features is not None:
+            artifact_feat = self.artifact_proj(artifact_features)
+            
+        # ================= 动态消融路由 =================
+        if AblationConfig.fusion_strategy == "none":
+            # 基线 A 或 B (单流直接穿透)
+            fused_feat = semantic_feat if semantic_feat is not None else artifact_feat
+            
+        elif AblationConfig.fusion_strategy == "mlp":
+            # 消融 D: 传统双层 MLP 硬拼接
+            joint_feat = torch.cat([semantic_feat, artifact_feat], dim=1)
+            fused_feat = self.traditional_mlp_fusion(joint_feat)
+            
+        else:
+            # 最终形态 (final) 和 消融 C: 动态 MoME 融合
+            joint_feat = torch.cat([semantic_feat, artifact_feat], dim=1)
+            gate_weights = self.gate_network(joint_feat)
+            
+            expert_outputs = [expert(joint_feat) for expert in self.experts.values()]
+            expert_outputs = torch.stack(expert_outputs, dim=1) 
+            gate_weights = gate_weights.unsqueeze(-1) 
+            
+            fused_feat = torch.sum(expert_outputs * gate_weights, dim=1) 
+            fused_feat = self.output_proj(fused_feat)
+            
+        # 统一打包为 Token 格式喂给 LLM
         latent_queries = self.latent_queries.unsqueeze(0).repeat(batch_size, 1, 1)
         fused_tokens = latent_queries + fused_feat.unsqueeze(1)
         

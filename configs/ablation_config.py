@@ -32,6 +32,3 @@ class AblationConfig:
             cls.fusion_strategy = "mlp"
         elif cls.EXPERIMENT_ID == "final":
             pass # final 保持所有组件默认全部开启
-
-# 初始化时自动执行逻辑判定
-AblationConfig.apply_config()

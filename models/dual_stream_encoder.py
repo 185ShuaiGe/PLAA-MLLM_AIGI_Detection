@@ -1,5 +1,3 @@
-
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +6,7 @@ from transformers import CLIPVisionModel
 from torchvision import models
 from configs.model_config import ModelConfig
 from configs.device_config import DeviceConfig
-
+from configs.ablation_config import AblationConfig
 
 class SemanticStream(nn.Module):
     def __init__(self, config):
@@ -100,12 +98,12 @@ class SRMFilter(nn.Module):
             param.requires_grad = False
     
     def forward(self, x):
-        # 应用 SRM 滤波器
-        out1 = self.filter1(x)
-        out2 = self.filter2(x)
-        out3 = self.filter3(x)
+        # 动态判定哪些滤波器被激活
+        out1 = self.filter1(x) if 1 in AblationConfig.active_srm_filters else torch.zeros_like(self.filter1(x))
+        out2 = self.filter2(x) if 2 in AblationConfig.active_srm_filters else torch.zeros_like(self.filter2(x))
+        out3 = self.filter3(x) if 3 in AblationConfig.active_srm_filters else torch.zeros_like(self.filter3(x))
         
-        # 拼接三个滤波器的输出
+        # 拼接三个滤波器的输出 (未激活的通道全是0，不会产生梯度和特征)
         out = torch.cat([out1, out2, out3], dim=1)
         return out
 
@@ -259,8 +257,8 @@ class DualStreamEncoder(nn.Module):
                 - 语义流特征字典
                 - 伪影流特征
         """
-        semantic_features = self.semantic_stream(x)
-        artifact_features = self.artifact_stream(x)
+        semantic_features = self.semantic_stream(x) if AblationConfig.use_semantic_stream else None
+        artifact_features = self.artifact_stream(x) if AblationConfig.use_artifact_stream else None
         return semantic_features, artifact_features
 
     def extract_multiscale_features(self, x):

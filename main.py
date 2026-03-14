@@ -1,30 +1,30 @@
 import os
+import json
 import argparse
 from datetime import datetime
+from typing import Optional
 
-# =========================================================================
-# 核心修复：必须在 import torch 和加载任何深度学习库之前解析参数并设置显卡可见性
-# =========================================================================
+# ==============================================================================
+# 核心机制：在导入 PyTorch 之前，必须先解析参数并配置 GPU 硬件隔离环境
+# ==============================================================================
 def parse_args() -> argparse.Namespace:
-    """
-    解析命令行参数
-    """
+    """ 解析命令行参数 """
     parser = argparse.ArgumentParser(description="DS-MoME AI Generated Image Detection")
     
-    parser.add_argument(
-        "--mode", 
-        type=str, 
-        default="inference", 
-        choices=["train", "val", "inference"],
-        help="运行模式: train/val/inference"
-    )
-    parser.add_argument("--image_path", type=str, default=None, help="推理模式: 输入图像路径")
+    # 运行模式与路径
+    parser.add_argument("--mode", type=str, default="inference", choices=["train", "val", "inference"], help="运行模式")
+    parser.add_argument("--image_path", type=str, default=None, help="推理模式: 输入单张图像路径")
     parser.add_argument("--image_dir", type=str, default=None, help="推理模式: 批量图像目录")
-    parser.add_argument("--checkpoint", type=str, default=None, help="模型检查点路径")
+    parser.add_argument("--checkpoint", type=str, default=None, help="模型权重(Checkpoint)路径")
+    
+    # 训练超参数
     parser.add_argument("--batch_size", type=int, default=8, help="批次大小")
     parser.add_argument("--num_epochs", type=int, default=10, help="训练轮数")
-    parser.add_argument("--lr", type=float, default=1e-5, help="学习率")
-    parser.add_argument('--gpu_id', type=int, default=0, help='指定使用的 GPU 编号 (例如 0 或 1)')
+    parser.add_argument("--lr", type=float, default=5e-5, help="学习率")
+    
+    # 硬件与消融实验
+    parser.add_argument("--gpu_id", type=int, default=0, help="指定物理 GPU 编号 (如 0 或 1)")
+    parser.add_argument("--ablation", type=str, default="final", help="指定消融组别 (A, B, C1, C2, C3, D, final)")
     
     return parser.parse_args()
 
@@ -37,38 +37,47 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["NCCL_IB_DISABLE"] = "1"
 
-# =========================================================================
-# 环境变量隔离完成后，现在才可以安全地导入 PyTorch 和模型库
-# =========================================================================
+
+# ==============================================================================
+# 硬件隔离完成，安全导入深度学习框架及本地模块
+# ==============================================================================
 import torch
-from typing import Optional
 from PIL import Image
 from torch.utils.data import DataLoader
+from torchvision import transforms
+
+from configs.ablation_config import AblationConfig
 from configs.model_config import ModelConfig
 from configs.device_config import DeviceConfig
 from configs.path_config import PathConfig
+
 from models.ds_mome import DSMoME
-from data.dataset_loader import get_holmes_dataloaders, val_AIGIDataset
 from models.trainer import DSMoMETrainer
 from models.validator import DSMoMEValidator
+from data.dataset_loader import get_holmes_dataloaders, val_AIGIDataset
 from utils.log_utils import Logger
-from torchvision import transforms
 
 
+# ==============================================================================
+# 主业务流程
+# ==============================================================================
 def main() -> None:
-    """
-    主函数：项目入口
-    """
-    # 此时 args 已经作为全局变量存在，直接使用即可
+    """ 项目主入口 """
+    
+    # --- 1. 应用消融实验配置 ---
+    AblationConfig.EXPERIMENT_ID = args.ablation
+    AblationConfig.apply_config()
+    
+    # --- 2. 初始化核心配置 ---
     model_config = ModelConfig()
     device_config = DeviceConfig()
+    path_config = PathConfig()
     
-    # 既然已经用环境变量隔离，PyTorch内部只能看到1张卡，所以其逻辑序号必须设置为 0
+    # 强制逻辑显卡编号为 0 (因外层已做物理隔离)
     device_config.gpu_ids = [0]
     device_config.cuda_visible_devices = str(args.gpu_id)
-    
-    path_config = PathConfig()
 
+    # --- 3. 动态日志目录与 Logger 初始化 ---
     if args.mode == 'inference':
         inf_type = 'single' if args.image_path else 'batch'
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -76,32 +85,25 @@ def main() -> None:
         
         custom_out_dir = os.path.join(path_config.outputs_dir, folder_name)
         os.makedirs(custom_out_dir, exist_ok=True)
-        log_dir_to_use = custom_out_dir
         path_config.outputs_dir = custom_out_dir
-    else:
-        log_dir_to_use = path_config.logs_dir
 
-    logger = Logger(name="DS_MoME_Main", log_dir=log_dir_to_use)
+    logger = Logger(
+        name="DS_MoME_Main", 
+        base_log_dir=path_config.logs_dir,
+        mode=args.mode,
+        exp_id=AblationConfig.EXPERIMENT_ID,
+        checkpoint_path=args.checkpoint
+    )
 
+    # --- 4. 打印环境与配置信息 ---
+    _print_config_info(args, logger)
 
-    # ================== 👇 打印命令行输入参数 👇 ==================
-    config_msg = "=" * 60 + "\nRun Configuration:\n"
-    for arg, value in vars(args).items():
-        if value is not None: 
-            config_msg += f"  {arg}: {value}\n"
-    config_msg += "=" * 60
-    print(config_msg)
-    # ==============================================================
+    # --- 5. 显存监控 (加载前) ---
+    mem_before = _get_allocated_memory(reset_peak=True)
 
-    # 🌟 显存记录点 1：加载大模型前
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats() # 删除了 0，默认使用当前设备
-        mem_before = torch.cuda.memory_allocated() / 1024**3
-    else:
-        mem_before = 0.0
-
+    # --- 6. 模型初始化与设备挂载 ---
+    logger.info("Initializing DS-MoME model...")
     model = DSMoME(model_config, device_config, path_config)
-
     device = device_config.get_device()
     
     model.dual_stream_encoder = model.dual_stream_encoder.to(device)
@@ -109,14 +111,15 @@ def main() -> None:
     model.vision_token_proj = model.vision_token_proj.to(device)
     model.detection_head = model.detection_head.to(device)
 
+    # 加载权重
     if args.checkpoint and os.path.exists(args.checkpoint):
         logger.info(f"Loading checkpoint from {args.checkpoint}")
         model.load_checkpoint(args.checkpoint)
 
-    # 🌟 显存记录点 2：加载大模型后
-    mem_after = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0
+    # --- 7. 显存监控 (加载后) ---
+    mem_after = _get_allocated_memory()
 
-    # 开始执行训练或推理
+    # --- 8. 核心路由执行 ---
     if args.mode == "train":
         train(model, args, logger, model_config, device_config, path_config)
     elif args.mode == "val":
@@ -124,22 +127,13 @@ def main() -> None:
     elif args.mode == "inference":
         inference(model, args, logger, model_config, device_config, path_config)
 
-    # 🌟 显存记录点 3：运行结束后获取全局峰值显存（即训练时的最大占用）
-    if torch.cuda.is_available():
-        mem_peak = torch.cuda.max_memory_allocated() / 1024**3
-        
-        summary_msg = (
-            "\n" + "=" * 60 + "\n"
-            "🚀 [显存占用追踪报告] 🚀\n"
-            f"1. 加载模型前基础占用: {mem_before:.2f} GB\n"
-            f"2. 加载全模型后占用:   {mem_after:.2f} GB\n"
-            f"   (模型净重: {(mem_after - mem_before):.2f} GB)\n"
-            f"3. 训练时峰值占用:     {mem_peak:.2f} GB\n"
-            f"   (训练计算额外开销: {(mem_peak - mem_after):.2f} GB)\n"
-            + "=" * 60
-        )
-        print(summary_msg)
+    # --- 9. 显存总结报告 ---
+    _print_memory_summary(mem_before, mem_after)
 
+
+# ==============================================================================
+# 核心功能模块
+# ==============================================================================
 def train(
     model: DSMoME,
     args: argparse.Namespace, 
@@ -148,7 +142,7 @@ def train(
     device_config: DeviceConfig,
     path_config: PathConfig
 ) -> None:
-    logger.info("Starting training")
+    logger.info("Starting training pipeline...")
     train_loader, val_loader = get_holmes_dataloaders(
         path_config, model_config, batch_size=args.batch_size
     )
@@ -173,23 +167,14 @@ def validate(
     device_config: DeviceConfig,
     path_config: PathConfig
 ) -> None:
-    logger.info("Starting validation")
+    logger.info("Starting validation pipeline...")
+    transform = _get_standard_transform()
 
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.48145466, 0.4578275, 0.40821073],
-            std=[0.26862954, 0.26130258, 0.27577711]
-        )
-    ])
-
-    val_dataset = val_AIGIDataset(
-        path_config.TEST_DATA_DIR, transform=transform)
+    val_dataset = val_AIGIDataset(path_config.TEST_DATA_DIR, transform=transform)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
     validator = DSMoMEValidator(model, model_config, device_config, path_config)
-    results = validator.validate(val_loader, save_results=True)
+    validator.validate(val_loader, save_results=True)
 
 
 def inference(
@@ -200,17 +185,8 @@ def inference(
     device_config: DeviceConfig,
     path_config: PathConfig
 ) -> None:
-    logger.info("Starting inference")
-
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.48145466, 0.4578275, 0.40821073],
-            std=[0.26862954, 0.26130258, 0.27577711]
-        )
-    ])
-
+    logger.info("Starting inference pipeline...")
+    transform = _get_standard_transform()
     device = device_config.get_device()
     model.eval()
 
@@ -221,7 +197,22 @@ def inference(
         logger.info(f"Processing batch images from: {args.image_dir}")
         _infer_batch_images(model, args.image_dir, transform, device, logger, path_config)
     else:
-        logger.error("Please provide either --image_path or --image_dir for inference")
+        logger.error("Please provide a valid --image_path or --image_dir for inference.")
+
+
+# ==============================================================================
+# 辅助工具函数
+# ==============================================================================
+def _get_standard_transform() -> transforms.Compose:
+    """ 获取统一的图像预处理流水线 """
+    return transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],
+            std=[0.26862954, 0.26130258, 0.27577711]
+        )
+    ])
 
 
 def _infer_single_image(
@@ -231,6 +222,7 @@ def _infer_single_image(
     device: torch.device,
     logger: Logger
 ) -> None:
+    """ 单张图像推理具体逻辑 """
     try:
         image = Image.open(image_path).convert("RGB")
         image_tensor = transform(image).unsqueeze(0).to(device)
@@ -238,14 +230,14 @@ def _infer_single_image(
         with torch.no_grad():
             detection_score = model.detect_image(image_tensor)
         
-        logger.info("=" * 60)
+        logger.info("-" * 60)
         logger.info(f"Image: {os.path.basename(image_path)}")
         logger.info(f"Detection Score: {detection_score:.4f}")
         logger.info(f"Classification: {'AI-Generated' if detection_score > 0.5 else 'Real'}")
-        logger.info("=" * 60)
+        logger.info("-" * 60)
         
     except Exception as e:
-        logger.error(f"Error processing image: {e}")
+        logger.error(f"Error processing image {image_path}: {e}")
 
 
 def _infer_batch_images(
@@ -256,39 +248,79 @@ def _infer_batch_images(
     logger: Logger,
     path_config: PathConfig
 ) -> None:
-    import json
-    
+    """ 批量图像推理具体逻辑 """
     results = []
-    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
+    valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
     
     for filename in os.listdir(image_dir):
-        if os.path.splitext(filename)[1].lower() in image_extensions:
-            image_path = os.path.join(image_dir, filename)
+        if os.path.splitext(filename)[1].lower() not in valid_extensions:
+            continue
             
-            try:
-                image = Image.open(image_path).convert("RGB")
-                image_tensor = transform(image).unsqueeze(0).to(device)
-                
-                with torch.no_grad():
-                    detection_score = model.detect_image(image_tensor)
-                
-                result = {
-                    'filename': filename,
-                    'detection_score': float(detection_score),
-                    'is_ai_generated': bool(detection_score > 0.5)
-                }
-                results.append(result)
-                
-                logger.info(f"{filename}: Score={detection_score:.4f}, Classification={'AI-Generated' if detection_score > 0.5 else 'Real'}")
-                
-            except Exception as e:
-                logger.warning(f"Failed to process {filename}: {e}")
+        image_path = os.path.join(image_dir, filename)
+        try:
+            image = Image.open(image_path).convert("RGB")
+            image_tensor = transform(image).unsqueeze(0).to(device)
+            
+            with torch.no_grad():
+                detection_score = model.detect_image(image_tensor)
+            
+            is_fake = bool(detection_score > 0.5)
+            results.append({
+                'filename': filename,
+                'detection_score': float(detection_score),
+                'is_ai_generated': is_fake
+            })
+            
+            cls_text = 'AI-Generated' if is_fake else 'Real'
+            logger.info(f"[{cls_text}] {filename} (Score: {detection_score:.4f})")
+            
+        except Exception as e:
+            logger.warning(f"Failed to process {filename}: {e}")
     
     output_file = os.path.join(path_config.outputs_dir, "inference_results.json")
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     
-    logger.info(f"Batch inference results saved to {output_file}")
+    logger.info(f"Batch inference results successfully saved to {output_file}")
+
+
+def _print_config_info(args: argparse.Namespace, logger: Logger) -> None:
+    """ 打印格式化的运行配置参数 """
+    msg = "\n" + "=" * 60 + "\n🚀 [Run Configuration] 🚀\n"
+    msg += f"  Experiment Group: {AblationConfig.EXPERIMENT_ID}\n"
+    for arg, value in vars(args).items():
+        if value is not None and arg != 'ablation':
+            msg += f"  {arg}: {value}\n"
+    msg += "=" * 60
+    print(msg)
+
+
+def _get_allocated_memory(reset_peak: bool = False) -> float:
+    """ 获取当前 GPU 已分配的显存 (单位: GB) """
+    if not torch.cuda.is_available():
+        return 0.0
+    if reset_peak:
+        torch.cuda.reset_peak_memory_stats()
+    return torch.cuda.memory_allocated() / (1024 ** 3)
+
+
+def _print_memory_summary(mem_before: float, mem_after: float) -> None:
+    """ 打印程序运行前后的显存使用报告 """
+    if not torch.cuda.is_available():
+        return
+        
+    mem_peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    msg = (
+        "\n" + "=" * 60 + "\n"
+        "📊 [Memory Tracking Report] 📊\n"
+        f"1. Pre-load baseline: {mem_before:.2f} GB\n"
+        f"2. Post-load memory:  {mem_after:.2f} GB\n"
+        f"   (Model footprint:  {(mem_after - mem_before):.2f} GB)\n"
+        f"3. Peak utilization:  {mem_peak:.2f} GB\n"
+        f"   (Runtime overhead: {(mem_peak - mem_after):.2f} GB)\n"
+        + "=" * 60
+    )
+    print(msg)
 
 
 if __name__ == "__main__":
