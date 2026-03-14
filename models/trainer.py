@@ -252,7 +252,7 @@ class DSMoMETrainer:
                 text_attention_mask = tokenized['attention_mask']
             
             with torch.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = self.model(images, "<image>\nAnalyze this image and determine if it is real or AI-generated.")
+                outputs = self.model(images, text_prompts)
                 loss_dict = self.compute_loss(outputs, labels_tensor, text_input_ids, text_attention_mask)
             
             loss = loss_dict['total_loss']
@@ -294,7 +294,7 @@ class DSMoMETrainer:
                 
                 # 使用与训练相同的精度
                 with torch.autocast(device_type='cuda', dtype=torch.float16): 
-                    outputs = self.model(images, "<image>\nAnalyze this image and determine if it is real or AI-generated.")
+                    outputs = self.model(images, text_prompts)
                     logits = outputs.get('detection_logits', None)
                     
                     if logits is not None:

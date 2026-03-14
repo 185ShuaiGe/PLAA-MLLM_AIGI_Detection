@@ -54,6 +54,11 @@ class DSMoME(nn.Module):
         # 即使 LLM 被冻结，也必须执行前向传播以实现特征对齐
         try:
             if self.llm_infer.tokenizer is not None:
+                # 🚨 致命修复 2：Batch Size 维度广播报错
+                batch_size = image.size(0)
+                if isinstance(text_prompt, str):
+                    text_prompt = [text_prompt] * batch_size
+                
                 tokenized = self.llm_infer.tokenizer(
                     text_prompt,
                     return_tensors='pt',
@@ -62,23 +67,26 @@ class DSMoME(nn.Module):
                     max_length=self.model_config.max_seq_len
                 ).to(image.device)
                 
+                # 🚨 致命修复 3：调用 llm_infer.forward 时传入 output_hidden_states=True
                 llm_out = self.llm_infer.forward(
                     input_ids=tokenized['input_ids'],
                     attention_mask=tokenized['attention_mask'],
-                    vision_tokens=projected_vision_tokens
+                    vision_tokens=projected_vision_tokens,
+                    output_hidden_states=True  # 必须加上这个参数
                 )
                 llm_outputs.update(llm_out)
                 
-                # 从 LLM 的最后隐藏状态中获取特征来计算分类头
-                last_hidden_state = llm_out.get('last_hidden_state', None)
-                if last_hidden_state is not None:
-                    # 使用最后一个 token 的隐藏状态或者平均池化所有隐藏状态
-                    pooled_llm = last_hidden_state.mean(dim=1)
-                    # 将 LLM 的隐藏状态转移到 detection_head 所在的设备
-                    pooled_llm = pooled_llm.to(self.detection_head[0].weight.device)
+                # 🚨 致命修复 3：正确提取 LLaMA 的隐藏状态
+                hidden_states = getattr(llm_out, 'hidden_states', llm_out.get('hidden_states', None))
+                if hidden_states is not None:
+                    # hidden_states 是一个元组，取最后一层 [-1]
+                    last_layer_hidden = hidden_states[-1]
+                    pooled_llm = last_layer_hidden.mean(dim=1)
+                    pooled_llm = pooled_llm.to(self.detection_head[0].weight.device).to(torch.float32)
                     detection_logits = self.detection_head(pooled_llm)
                 else:
-                    # 备用方案：如果 LLM 没有返回隐藏状态，继续使用视觉特征
+                    # 如果还是没有，必须打印高亮警告，防止静默失败
+                    print("🚨 CRITICAL WARNING: LLM did not return hidden_states! Falling back to vision tokens.")
                     pooled_vision = projected_vision_tokens.mean(dim=1)
                     detection_logits = self.detection_head(pooled_vision)
         except Exception as e:

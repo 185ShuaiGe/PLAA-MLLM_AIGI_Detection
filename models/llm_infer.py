@@ -26,8 +26,8 @@ class LLMInference(nn.Module):
             self.llm_model = AutoModelForCausalLM.from_pretrained(
                 config.llm_model_name,
                 quantization_config=quantization_config,
-                device_map="auto",        
-                max_memory={0: "23GiB", 1: "0GiB"}
+                device_map={"": 0},        
+                max_memory={0: "0GiB", 1: "23GiB"}
             )
         except Exception as e:
             print(f"Error loading LLM: {e}")
@@ -57,7 +57,8 @@ class LLMInference(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        vision_tokens: Optional[torch.Tensor] = None
+        vision_tokens: Optional[torch.Tensor] = None,
+        output_hidden_states: bool = True
     ):
         """
         LLM 前向传播
@@ -66,12 +67,13 @@ class LLMInference(nn.Module):
             input_ids: 文本输入 token ID，形状 [B, T]，其中 B=batch_size, T=token长度
             attention_mask: 注意力掩码，形状 [B, T]
             vision_tokens: 可选的视觉令牌，形状 [B, N, D]，来自 ForensicCrossAttention
+            output_hidden_states: 是否返回隐藏状态
 
         Returns:
             Dict[str, torch.Tensor]: LLM 输出字典
                 - 'logits': 输出 logits，形状 [B, N+T, V]，V=vocab_size
                     注意：序列长度为 N（视觉令牌数量）+ T（文本令牌数量）
-                - 'last_hidden_state': LLM 最后一层的隐藏状态
+                - 'hidden_states': LLM 所有隐藏状态元组
                 - 'loss': 可选的损失值（训练时）
         """
         if self.llm_model is None:
@@ -109,19 +111,20 @@ class LLMInference(nn.Module):
             outputs = self.llm_model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=fused_attention_mask,
-                output_hidden_states=True
+                output_hidden_states=output_hidden_states
             )
         else:
             outputs = self.llm_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                output_hidden_states=True
+                output_hidden_states=output_hidden_states
             )
         
-        return {
-            'logits': outputs.logits,
-            'last_hidden_state': outputs.hidden_states[-1] if hasattr(outputs, 'hidden_states') else None
-        }
+        result = {'logits': outputs.logits}
+        if hasattr(outputs, 'hidden_states'):
+            result['hidden_states'] = outputs.hidden_states
+        
+        return result
     
     def generate(
         self,

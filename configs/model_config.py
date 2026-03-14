@@ -3,7 +3,7 @@ class ModelConfig:
     #local
     #clip_model_name = "D:\\cache\\huggingface_cache\\hub\\models--openai--clip-vit-large-patch14"  
     # schoolserver
-    clip_model_name = "/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/PLAA-MLLM_AIGI_Detection/cache/models--openai--clip-vit-large-patch14"  
+    clip_model_name = "/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/DS-MoME/cache/models--openai--clip-vit-large-patch14"  
 
     clip_dim = 1024
     clip_intermediate_layers = [8, 16, 24]
@@ -17,7 +17,7 @@ class ModelConfig:
     #local
     # llm_model_name = "D:\\cache\\huggingface_cache\\hub\\models--meta-llama--Meta-Llama-3.1-8B-Instruct"    
     # schoolserver
-    llm_model_name = "/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/PLAA-MLLM_AIGI_Detection/cache/models--meta-llama--Meta-Llama-3.1-8B-Instruct"
+    llm_model_name = "/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/DS-MoME/cache/models--meta-llama--Meta-Llama-3.1-8B-Instruct"
     
     llm_dim = 4096
     use_text_guidance = True

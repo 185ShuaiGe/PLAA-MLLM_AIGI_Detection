@@ -1,4 +1,20 @@
 import os
+import argparse
+
+# =========================================================
+# 0. 解析参数并隔离显卡 (必须在 import torch 之前执行)
+# =========================================================
+parser = argparse.ArgumentParser(description="Test DSMoME on FDMAS dataset")
+parser.add_argument('--gpu_id', type=int, default=0, help='指定使用的 GPU 编号 (例如 0 或 1)')
+args = parser.parse_args()
+
+# 强制系统只对当前 Python 进程暴露指定的显卡，逻辑编号永远为 0
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# =========================================================
+# 导入深度学习库 (此时 PyTorch 只能看到你指定的那张卡)
+# =========================================================
 import torch
 import numpy as np
 from sklearn.metrics import average_precision_score, accuracy_score
@@ -12,7 +28,7 @@ import warnings
 from configs.model_config import ModelConfig
 from configs.device_config import DeviceConfig
 from configs.path_config import PathConfig
-from models.plaa_mllm import PLAAMLLM
+from models.ds_mome import DSMoME
 from peft import LoraConfig, get_peft_model
 
 # 忽略烦人的警告
@@ -25,7 +41,7 @@ warnings.filterwarnings('ignore')
 TEST_ROOT = '/data/Disk_A/wangxinchang/Datasets/fdmas/test/'
 
 # 你的训练权重路径
-MODEL_PATH = '/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/PLAA-MLLM_AIGI_Detection/weights/checkpoint_stage1_best.pt'
+MODEL_PATH = '/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/DS-MoME/weights/checkpoint_best.pt'
 
 # 批大小 (由于 MLLM 显存占用较大，建议调小，如 8 或 16)
 BATCH_SIZE = 4
@@ -38,25 +54,34 @@ TEXT_PROMPT = "<image>\nAnalyze this image and determine if it is real or AI-gen
 # ---------------------------------------------------------
 def main():
     print(f"🚀 开始测试 FDMAS 数据集...")
+    print(f"🖥️  使用物理 GPU 编号: {args.gpu_id}")
     print(f"📂 数据集路径: {TEST_ROOT}")
     print(f"⚖️  模型路径: {MODEL_PATH}")
     
     # 初始化配置
     model_config = ModelConfig()
     device_config = DeviceConfig()
+    
+    # 强制将配置中的设备对齐到当前唯一的逻辑卡 0
+    device_config.gpu_ids = [0]
+    device_config.cuda_visible_devices = str(args.gpu_id)
+    
     path_config = PathConfig()
+    # 获取设备 (此时将返回 cuda:0)
     device = device_config.get_device()
 
     # 1. 初始化模型
-    print("⏳ 正在初始化 PLAA-MLLM 模型...")
-    model = PLAAMLLM(model_config, device_config, path_config)
+    print("⏳ 正在初始化 DSMoME 模型...")
+    model = DSMoME(model_config, device_config, path_config)
 
     # 手动将非大语言模型的模块移动到主设备 (适配你原本 main.py 中的设定)
     model.dual_stream_encoder = model.dual_stream_encoder.to(device)
     model.mome_fusion = model.mome_fusion.to(device)
     model.vision_token_proj = model.vision_token_proj.to(device)
     model.detection_head = model.detection_head.to(device)
-    model.mask_head = model.mask_head.to(device)
+    # 如果你在后续更新中删除了 mask_head，请把下面这行注释掉；如果还在则保留
+    if hasattr(model, 'mask_head') and model.mask_head is not None:
+        model.mask_head = model.mask_head.to(device)
 
     # 2. 加载权重 (包含自动兼容 Stage 2 LoRA 的逻辑)
     print("⏳ 正在加载权重...")
@@ -128,10 +153,11 @@ def main():
         
         # 推理循环
         with torch.no_grad():
+            # 使用 tqdm 包装 dataloader 显示进度条（可选，如果不想要可以删去 tqdm()）
             for images, labels in dataloader:
                 images = images.to(device)
                 
-                # 构造 PLAA-MLLM 需要的文本输入
+                # 构造 DSMoME 需要的文本输入
                 prompts = [TEXT_PROMPT] * images.size(0)
                 
                 # 开启混合精度以节省显存并避免报错 (与 trainer.py 保持一致)

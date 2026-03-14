@@ -177,8 +177,8 @@ class ResNetArtifactStream(nn.Module):
         # 固定的 SRM 滤波器组
         self.srm_filter = SRMFilter()
         
-        # 加载预训练的 ResNet50
-        resnet = models.resnet50(pretrained=True)
+        # 加载预训练的 ResNet101
+        resnet = models.resnet101(weights=models.ResNet101_Weights.DEFAULT)
         
         # 移除最后的全连接层
         self.resnet_backbone = nn.Sequential(*list(resnet.children())[:-2])

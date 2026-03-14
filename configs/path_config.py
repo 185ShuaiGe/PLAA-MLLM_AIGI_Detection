@@ -14,13 +14,13 @@ class PathConfig:
     # llm_model_name = "D:\\cache\\huggingface_cache\\hub\\models--meta-llama--Meta-Llama-3.1-8B-Instruct"    
 
     # schoolserver
-    pretrained_clip_path = "/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/PLAA-MLLM_AIGI_Detection/cache/models--openai--clip-vit-large-patch14"
-    pretrained_resnet_path = "/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/PLAA-MLLM_AIGI_Detection/cache/resnet50-0676ba61.pth"
-    llm_model_name = "/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/PLAA-MLLM_AIGI_Detection/cache/models--meta-llama--Meta-Llama-3.1-8B-Instruct"
+    pretrained_clip_path = "/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/DS-MoME/cache/models--openai--clip-vit-large-patch14"
+    pretrained_resnet_path = "/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/DS-MoME/cache/resnet50-0676ba61.pth"
+    llm_model_name = "/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/DS-MoME/cache/models--meta-llama--Meta-Llama-3.1-8B-Instruct"
 
 
     checkpoint_path = os.path.join(weights_dir, "ds_mome_checkpoint.pt")
 
     # 在 configs/path_config.py 中，用于测试的路径
     TEST_DATA_DIR = "/data/Disk_A/wangxinchang/Datasets/val/progan"
-    CHECKPOINT_PATH = "/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/PLAA-MLLM_AIGI_Detection/weights/checkpoint_stage2_best.pt"
+    CHECKPOINT_PATH = "/data/Disk_A/wangxinchang/DeepfakeDetectionMethods/DS-MoME/weights/checkpoint_stage2_best.pt"

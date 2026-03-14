@@ -1,37 +1,13 @@
 import os
-from datetime import datetime
-#PyTorch 在训练时容易产生显存碎片，开启 expandable_segments 可以缓解此问题，避免因为找不到连续大块显存而报错。
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["NCCL_P2P_DISABLE"] = "1"
-os.environ["NCCL_IB_DISABLE"] = "1"
 import argparse
-import torch
-# 提前唤醒多卡的 CUDA 上下文，消除 cuBLAS 警告
-if torch.cuda.is_available():
-    torch.tensor([0.0], device='cuda:0')
-    torch.tensor([0.0], device='cuda:1')
-from typing import Optional
-from argparse import Namespace
-from PIL import Image
-from torch.utils.data import DataLoader
-from configs.model_config import ModelConfig
-from configs.device_config import DeviceConfig
-from configs.path_config import PathConfig
-from models.ds_mome import DSMoME
-from data.dataset_loader import AIGIDataset, val_AIGIDataset
-from models.trainer import DSMoMETrainer
-from models.validator import DSMoMEValidator
-from utils.metrics_utils import MetricsCalculator
-from utils.log_utils import Logger
-from torchvision import transforms
+from datetime import datetime
 
-
-def parse_args() -> Namespace:
+# =========================================================================
+# 核心修复：必须在 import torch 和加载任何深度学习库之前解析参数并设置显卡可见性
+# =========================================================================
+def parse_args() -> argparse.Namespace:
     """
     解析命令行参数
-
-    Returns:
-        Namespace: 解析后的命令行参数
     """
     parser = argparse.ArgumentParser(description="DS-MoME AI Generated Image Detection")
     
@@ -42,100 +18,105 @@ def parse_args() -> Namespace:
         choices=["train", "val", "inference"],
         help="运行模式: train/val/inference"
     )
-    parser.add_argument(
-        "--image_path", 
-        type=str, 
-        default=None, 
-        help="推理模式: 输入图像路径"
-    )
-    parser.add_argument(
-        "--image_dir", 
-        type=str, 
-        default=None, 
-        help="推理模式: 批量图像目录"
-    )
-    parser.add_argument(
-        "--checkpoint", 
-        type=str, 
-        default=None, 
-        help="模型检查点路径"
-    )
-    parser.add_argument(
-        "--batch_size", 
-        type=int, 
-        default=8, 
-        help="批次大小"
-    )
-    parser.add_argument(
-        "--num_epochs", 
-        type=int, 
-        default=10, 
-        help="训练轮数"
-    )
-    parser.add_argument(
-        "--lr", 
-        type=float, 
-        default=1e-5, 
-        help="学习率"
-    )
+    parser.add_argument("--image_path", type=str, default=None, help="推理模式: 输入图像路径")
+    parser.add_argument("--image_dir", type=str, default=None, help="推理模式: 批量图像目录")
+    parser.add_argument("--checkpoint", type=str, default=None, help="模型检查点路径")
+    parser.add_argument("--batch_size", type=int, default=8, help="批次大小")
+    parser.add_argument("--num_epochs", type=int, default=10, help="训练轮数")
+    parser.add_argument("--lr", type=float, default=1e-5, help="学习率")
+    parser.add_argument('--gpu_id', type=int, default=0, help='指定使用的 GPU 编号 (例如 0 或 1)')
     
     return parser.parse_args()
+
+# 1. 立即解析参数
+args = parse_args()
+
+# 2. 立即设置环境变量，在 PyTorch 初始化前对系统显卡进行硬隔离
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["NCCL_P2P_DISABLE"] = "1"
+os.environ["NCCL_IB_DISABLE"] = "1"
+
+# =========================================================================
+# 环境变量隔离完成后，现在才可以安全地导入 PyTorch 和模型库
+# =========================================================================
+import torch
+from typing import Optional
+from PIL import Image
+from torch.utils.data import DataLoader
+from configs.model_config import ModelConfig
+from configs.device_config import DeviceConfig
+from configs.path_config import PathConfig
+from models.ds_mome import DSMoME
+from data.dataset_loader import AIGIDataset, val_AIGIDataset
+from models.trainer import DSMoMETrainer
+from models.validator import DSMoMEValidator
+from utils.log_utils import Logger
+from torchvision import transforms
 
 
 def main() -> None:
     """
     主函数：项目入口
     """
-    args = parse_args()
-
+    # 此时 args 已经作为全局变量存在，直接使用即可
     model_config = ModelConfig()
     device_config = DeviceConfig()
+    
+    # 既然已经用环境变量隔离，PyTorch内部只能看到1张卡，所以其逻辑序号必须设置为 0
+    device_config.gpu_ids = [0]
+    device_config.cuda_visible_devices = str(args.gpu_id)
+    
     path_config = PathConfig()
 
     if args.mode == 'inference':
-        # 判断是单张图推理还是批量推理
         inf_type = 'single' if args.image_path else 'batch'
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
         folder_name = f"inference_{inf_type}_{current_time}"
         
-        # 将路径指向 outputs 目录下的新文件夹
         custom_out_dir = os.path.join(path_config.outputs_dir, folder_name)
         os.makedirs(custom_out_dir, exist_ok=True)
-        
-        # 指定 Logger 使用这个新文件夹
         log_dir_to_use = custom_out_dir
-        
-        # 顺便把 outputs_dir 覆写，这样后续生成的 inference_results.json 也会存到这里
         path_config.outputs_dir = custom_out_dir
     else:
-        # 训练和验证模式保持使用默认的 logs 目录
         log_dir_to_use = path_config.logs_dir
 
-    # 使用动态决定的路径初始化主 Logger
     logger = Logger(name="DS_MoME_Main", log_dir=log_dir_to_use)
 
-    # 1. 实例化基础模型
+
+    # ================== 👇 打印命令行输入参数 👇 ==================
+    config_msg = "=" * 60 + "\nRun Configuration:\n"
+    for arg, value in vars(args).items():
+        if value is not None: 
+            config_msg += f"  {arg}: {value}\n"
+    config_msg += "=" * 60
+    print(config_msg)
+    # ==============================================================
+
+    # 🌟 显存记录点 1：加载大模型前
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats() # 删除了 0，默认使用当前设备
+        mem_before = torch.cuda.memory_allocated() / 1024**3
+    else:
+        mem_before = 0.0
+
     model = DSMoME(model_config, device_config, path_config)
 
-
-    # 单卡训练
-    # device = device_config.get_device()
-    # model = model.to(device)
-
-    # 多卡训练
     device = device_config.get_device()
     
-    # 手动将非大语言模型的模块移动到主设备 cuda:0
     model.dual_stream_encoder = model.dual_stream_encoder.to(device)
     model.mome_fusion = model.mome_fusion.to(device)
     model.vision_token_proj = model.vision_token_proj.to(device)
     model.detection_head = model.detection_head.to(device)
-    # model.llm_infer 内部的 llm_model 已经通过 device_map="auto" 分布在两张卡上了，不要动它
 
     if args.checkpoint and os.path.exists(args.checkpoint):
         logger.info(f"Loading checkpoint from {args.checkpoint}")
         model.load_checkpoint(args.checkpoint)
 
+    # 🌟 显存记录点 2：加载大模型后
+    mem_after = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0
+
+    # 开始执行训练或推理
     if args.mode == "train":
         train(model, args, logger, model_config, device_config, path_config)
     elif args.mode == "val":
@@ -143,30 +124,34 @@ def main() -> None:
     elif args.mode == "inference":
         inference(model, args, logger, model_config, device_config, path_config)
 
+    # 🌟 显存记录点 3：运行结束后获取全局峰值显存（即训练时的最大占用）
+    if torch.cuda.is_available():
+        mem_peak = torch.cuda.max_memory_allocated() / 1024**3
+        
+        summary_msg = (
+            "\n" + "=" * 60 + "\n"
+            "🚀 [显存占用追踪报告] 🚀\n"
+            f"1. 加载模型前基础占用: {mem_before:.2f} GB\n"
+            f"2. 加载全模型后占用:   {mem_after:.2f} GB\n"
+            f"   (模型净重: {(mem_after - mem_before):.2f} GB)\n"
+            f"3. 训练时峰值占用:     {mem_peak:.2f} GB\n"
+            f"   (训练计算额外开销: {(mem_peak - mem_after):.2f} GB)\n"
+            + "=" * 60
+        )
+        print(summary_msg)
 
 def train(
     model: DSMoME,
-    args: Namespace, 
+    args: argparse.Namespace, 
     logger: Logger,
     model_config: ModelConfig,
     device_config: DeviceConfig,
     path_config: PathConfig
 ) -> None:
-    """
-    训练模式
-
-    Args:
-        model: DS-MoME 模型
-        args: 命令行参数
-        logger: 日志记录器
-        model_config: 模型配置
-        device_config: 设备配置
-        path_config: 路径配置
-    """
-    logger.info("Starting training")      #日志第二条信息：开始训练
+    logger.info("Starting training")
 
     train_dataset = AIGIDataset(
-        path_config, model_config, split="train")   #日志第三条信息：加载训练数据集
+        path_config, model_config, split="train")
     val_dataset = AIGIDataset(
         path_config, model_config, split="val")
 
@@ -184,28 +169,17 @@ def train(
         learning_rate=args.lr,
         batch_size=args.batch_size,
         checkpoint_path=args.checkpoint
-    )    #日志第四条信息：开始训练
+    )
 
 
 def validate(
     model: DSMoME, 
-    args: Namespace, 
+    args: argparse.Namespace, 
     logger: Logger,
     model_config: ModelConfig,
     device_config: DeviceConfig,
     path_config: PathConfig
 ) -> None:
-    """
-    验证模式
-
-    Args:
-        model: PLAA-MLLM 模型
-        args: 命令行参数
-        logger: 日志记录器
-        model_config: 模型配置
-        device_config: 设备配置
-        path_config: 路径配置
-    """
     logger.info("Starting validation")
 
     transform = transforms.Compose([
@@ -224,36 +198,15 @@ def validate(
     validator = DSMoMEValidator(model, model_config, device_config, path_config)
     results = validator.validate(val_loader, save_results=True)
 
-    #已经在validator中计算了指标，无需重复计算
-    # metrics_calculator = MetricsCalculator(path_config)
-    # true_labels = results.get('true_labels', [])
-    # pred_scores = results.get('pred_scores', [])
-    
-    # if true_labels and pred_scores:
-    #     metrics = metrics_calculator.calculate_all_metrics(true_labels, pred_scores)
-    #     logger.info(f"Validation Metrics: {metrics}")
-    #     metrics_calculator.visualize_metrics(metrics, true_labels, pred_scores)
-
 
 def inference(
     model: DSMoME, 
-    args: Namespace, 
+    args: argparse.Namespace, 
     logger: Logger,
     model_config: ModelConfig,
     device_config: DeviceConfig,
     path_config: PathConfig
 ) -> None:
-    """
-    推理模式
-
-    Args:
-        model: DS-MoME 模型
-        args: 命令行参数
-        logger: 日志记录器
-        model_config: 模型配置
-        device_config: 设备配置
-        path_config: 路径配置
-    """
     logger.info("Starting inference")
 
     transform = transforms.Compose([
@@ -285,16 +238,6 @@ def _infer_single_image(
     device: torch.device,
     logger: Logger
 ) -> None:
-    """
-    推理单张图像
-
-    Args:
-        model: DS-MoME 模型
-        image_path: 图像路径
-        transform: 图像变换
-        device: 设备
-        logger: 日志记录器
-    """
     try:
         image = Image.open(image_path).convert("RGB")
         image_tensor = transform(image).unsqueeze(0).to(device)
@@ -320,17 +263,6 @@ def _infer_batch_images(
     logger: Logger,
     path_config: PathConfig
 ) -> None:
-    """
-    批量推理图像
-
-    Args:
-        model: DS-MoME 模型
-        image_dir: 图像目录
-        transform: 图像变换
-        device: 设备
-        logger: 日志记录器
-        path_config: 路径配置
-    """
     import json
     
     results = []
